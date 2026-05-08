@@ -200,6 +200,33 @@ class VectorService:
             logger.error(f"Failed to add document {doc_id} to vector DB: {e}")
             return False
 
+    def add_user_text_entry(self, entry_id: int, user_id: int, text: str, intent_tag: str = "expense_text") -> bool:
+        """Add user free-text entry to vector DB for semantic recall."""
+        try:
+            normalized_text = (text or "").strip()
+            if not normalized_text:
+                return False
+
+            embedding = self._generate_embedding(normalized_text)
+            vector_id = f"text_entry_{entry_id}"
+            self.collection.upsert(
+                ids=[vector_id],
+                embeddings=[embedding],
+                metadatas=[{
+                    "user_id": user_id,
+                    "doc_id": -entry_id,  # keep numeric-compatible metadata slot
+                    "type": "user_text_entry",
+                    "intent_tag": intent_tag,
+                    "text": normalized_text[:1000],
+                }],
+                documents=[normalized_text]
+            )
+            logger.info(f"Added user text entry {entry_id} to vector DB for user {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add user text entry {entry_id} to vector DB: {e}")
+            return False
+
     def delete_document(self, doc_id: int) -> bool:
         """Delete a document from the vector database."""
         try:
@@ -267,17 +294,38 @@ class VectorService:
                     # Calculate similarity score (0-100%)
                     similarity = max(0, min(100, (1 - distance) * 100))
 
-                    # Handle both numeric document IDs and string SQL result IDs
+                    entry_type = metadata.get("type", "document")
+
+                    # Skip query-history artifacts.
+                    if isinstance(doc_id, str) and doc_id.startswith("sql_result_"):
+                        continue
+
+                    if entry_type == "user_text_entry" and isinstance(doc_id, str) and doc_id.startswith("text_entry_"):
+                        try:
+                            text_entry_id = int(doc_id.split("text_entry_")[1])
+                        except Exception:
+                            continue
+                        matches.append({
+                            "doc_id": None,
+                            "text_entry_id": text_entry_id,
+                            "entry_type": "user_text_entry",
+                            "user_id": metadata.get("user_id", user_id),
+                            "text": document[:500],
+                            "similarity_score": round(similarity, 2),
+                            "source": "vector_search"
+                        })
+                        continue
+
+                    # Regular document IDs
                     try:
-                        # Try to convert to int (regular document ID)
                         doc_id_int = int(doc_id)
                     except (ValueError, TypeError):
-                        # Skip SQL result entries - they have string IDs like "sql_result_..."
-                        # These are query history, not actual documents
                         continue
 
                     matches.append({
                         "doc_id": doc_id_int,
+                        "text_entry_id": None,
+                        "entry_type": "document",
                         "user_id": metadata.get("user_id", user_id),
                         "text": document[:500],  # Truncate for display
                         "similarity_score": round(similarity, 2),

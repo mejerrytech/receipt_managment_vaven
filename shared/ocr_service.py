@@ -111,6 +111,34 @@ Critical fields for confidence assessment:
 
 Adapt the fields based on the document type. For non-financial documents, include relevant fields."""
 
+        self.expense_categories = [
+            "Food and Dining", "Groceries", "Rent", "Utilities", "Fual", "Shopping",
+            "Entertainment", "Healthcare", "Edication", "Personal care", "Subscription",
+            "EMI/Loans", "Insurance", "Investment", "Travel", "Savings", "CAB/Taxi",
+            "Misecellaneous", "Other"
+        ]
+
+    def _build_effective_prompt(
+        self,
+        custom_prompt: Optional[str] = None,
+        user_input_text: Optional[str] = None
+    ) -> str:
+        base_prompt = custom_prompt or self.extraction_prompt
+        categories_text = ", ".join(self.expense_categories)
+        user_text_section = (
+            f'\n\nUser-provided upload text/intention:\n"{user_input_text}"\n'
+            "Use this text as additional context while extracting fields."
+            if user_input_text else
+            "\n\nUser-provided upload text/intention: null"
+        )
+        return (
+            f"{base_prompt}\n\n"
+            "Also infer a best-fit `expense_category` from this list (if possible):\n"
+            f"{categories_text}\n"
+            "If not inferable, set expense_category to \"Other\"."
+            f"{user_text_section}"
+        )
+
     def _encode_image(self, image_bytes: bytes, mime_type: str) -> str:
         """Encode image to base64."""
         return base64.b64encode(image_bytes).decode('utf-8')
@@ -160,11 +188,12 @@ Adapt the fields based on the document type. For non-financial documents, includ
         self,
         image_bytes: bytes,
         mime_type: str,
-        custom_prompt: Optional[str] = None
+        custom_prompt: Optional[str] = None,
+        user_input_text: Optional[str] = None
     ) -> Optional[OCRResult]:
         """Extract data using GPT-4o Vision."""
         try:
-            user_prompt = custom_prompt or self.extraction_prompt
+            user_prompt = self._build_effective_prompt(custom_prompt, user_input_text)
             base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
             response = await asyncio.to_thread(
@@ -229,12 +258,13 @@ Adapt the fields based on the document type. For non-financial documents, includ
         self, 
         image_bytes: bytes, 
         mime_type: str,
-        custom_prompt: Optional[str] = None
+        custom_prompt: Optional[str] = None,
+        user_input_text: Optional[str] = None
     ) -> Optional[OCRResult]:
         """Extract data using Claude Opus 4.5."""
         try:
             base64_image = self._encode_image(image_bytes, mime_type)
-            user_prompt = custom_prompt or self.extraction_prompt
+            user_prompt = self._build_effective_prompt(custom_prompt, user_input_text)
             
             response = await asyncio.to_thread(
                 self.claude_client.messages.create,
@@ -297,7 +327,8 @@ Adapt the fields based on the document type. For non-financial documents, includ
         self, 
         image_bytes: bytes, 
         mime_type: str,
-        custom_prompt: Optional[str] = None
+        custom_prompt: Optional[str] = None,
+        user_input_text: Optional[str] = None
     ) -> str:
         """
         Extract data from image with confidence-based model routing.
@@ -313,11 +344,11 @@ Adapt the fields based on the document type. For non-financial documents, includ
         logger.info("Starting OCR extraction with GPT-4o Vision (primary)")
 
         # Step 1: Try GPT-4o first
-        gpt4o_result = await self._extract_with_gpt4o(image_bytes, mime_type, custom_prompt)
+        gpt4o_result = await self._extract_with_gpt4o(image_bytes, mime_type, custom_prompt, user_input_text)
 
         if gpt4o_result is None:
             logger.warning("GPT-4o OCR failed, falling back to Claude Opus 4.5")
-            claude_result = await self._extract_with_claude(image_bytes, mime_type, custom_prompt)
+            claude_result = await self._extract_with_claude(image_bytes, mime_type, custom_prompt, user_input_text)
             
             if claude_result is None:
                 return json.dumps({
@@ -347,7 +378,7 @@ Adapt the fields based on the document type. For non-financial documents, includ
         if min_critical < FALLBACK_THRESHOLD:
             logger.warning(f"GPT-4o confidence too low ({min_critical:.2f}), trying Claude Opus 4.5")
             
-            claude_result = await self._extract_with_claude(image_bytes, mime_type, custom_prompt)
+            claude_result = await self._extract_with_claude(image_bytes, mime_type, custom_prompt, user_input_text)
             
             if claude_result:
                 # Compare and take the better result

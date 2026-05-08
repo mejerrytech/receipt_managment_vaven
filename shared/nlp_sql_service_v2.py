@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 # Import orchestration layer
 from shared.orchestrator import get_orchestrator, AgentType, ModelProvider, AgentStep
 from shared.vector_service import get_vector_service
+from shared.database import DatabaseService
 
 load_dotenv()
 
@@ -55,6 +56,16 @@ Tables:
    - raw_text (TEXT)
    - created_at (DATETIME)
 
+3. user_text_entries
+   - id (INTEGER PRIMARY KEY)
+   - user_id (INTEGER FOREIGN KEY -> users.id)
+   - text (TEXT)
+   - intent_tag (VARCHAR)
+   - expense_category (VARCHAR)
+   - amount (FLOAT)
+   - currency (VARCHAR)
+   - created_at (DATETIME)
+
 Key notes:
 - Always filter by user_id for security
 - extracted_data contains full JSON from OCR with ALL details including:
@@ -68,6 +79,8 @@ Key notes:
 - For item-level queries ("kya kya laya", "what items"), return extracted_data as raw_data field and let formatter summarize items
 - document_type examples: invoice, receipt, product_listing, etc.
 - Amounts are in the currency specified (mostly INR)
+- user_text_entries stores manual user expense text (e.g. "Maine room rent 8000 diya").
+  For expense totals/category queries, include this table along with documents when relevant.
 """
 
 # Function schema for generate_sql function calling
@@ -148,6 +161,34 @@ CLASSIFY_SUMMARY_ROUTING_FUNCTION = {
     }
 }
 
+# Function schema for deciding whether plain user text should be stored
+CLASSIFY_STORAGE_DECISION_FUNCTION = {
+    "name": "classify_storage_decision",
+    "description": "Decide whether a plain user text should be saved as expense-related entry",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "should_store": {
+                "type": "boolean",
+                "description": "True when message is a real expense/payment statement that should be stored"
+            },
+            "category": {
+                "type": "string",
+                "description": "Best-fit expense category if should_store is true, else Other"
+            },
+            "reason": {
+                "type": "string",
+                "description": "Short explanation of decision"
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence between 0 and 1"
+            }
+        },
+        "required": ["should_store", "category", "reason", "confidence"]
+    }
+}
+
 
 class NLPSQLServiceV2:
     """
@@ -165,6 +206,7 @@ class NLPSQLServiceV2:
         self.orchestrator = get_orchestrator()
         # Vector service for fallback
         self.vector_service = get_vector_service()
+        self.expense_categories = DatabaseService.EXPENSE_CATEGORIES
         # Conversation history: {user_id: [{"query": str, "response": str}, ...]}
         self.conversation_history: Dict[int, List[Dict[str, str]]] = {}
         self.MAX_HISTORY = 10
@@ -246,12 +288,30 @@ class NLPSQLServiceV2:
     def _build_global_summary_sql(self, user_id: int) -> str:
         """Return canonical aggregate SQL for global expense summary requests."""
         return f"""SELECT
-  COUNT(*) as total_documents,
-  COALESCE(SUM(total_amount), 0) as total_amount,
-  COUNT(DISTINCT vendor_name) as unique_vendors,
-  COALESCE(AVG(total_amount), 0) as avg_amount
-FROM documents
-WHERE user_id = {user_id}"""
+  (SELECT COUNT(*) FROM documents WHERE user_id = {user_id}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL) as total_documents,
+  COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL), 0) as total_amount,
+  (SELECT COUNT(DISTINCT vendor_name) FROM documents WHERE user_id = {user_id} AND vendor_name IS NOT NULL) as unique_vendors,
+  (
+    COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL), 0)
+  ) / NULLIF(
+    (SELECT COUNT(*) FROM documents WHERE user_id = {user_id}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL),
+    0
+  ) as avg_amount"""
+
+    def _is_rent_query(self, user_query: str) -> bool:
+        q = (user_query or "").lower()
+        return any(k in q for k in ["rent", "room rent", "house rent", "kiraya"])
+
+    def _build_rent_total_sql(self, user_id: int) -> str:
+        """Rent total across OCR documents + manual user text entries."""
+        return f"""SELECT
+  COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id} AND (LOWER(title) LIKE '%rent%' OR LOWER(vendor_name) LIKE '%rent%' OR LOWER(extracted_data) LIKE '%rent%')), 0) as document_rent_total,
+  COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL AND (LOWER(expense_category) = 'rent' OR LOWER(text) LIKE '%rent%' OR LOWER(text) LIKE '%kiraya%')), 0) as text_rent_total,
+  (
+    COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id} AND (LOWER(title) LIKE '%rent%' OR LOWER(vendor_name) LIKE '%rent%' OR LOWER(extracted_data) LIKE '%rent%')), 0)
+    +
+    COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL AND (LOWER(expense_category) = 'rent' OR LOWER(text) LIKE '%rent%' OR LOWER(text) LIKE '%kiraya%')), 0)
+  ) as total_rent"""
 
     def _should_use_global_summary_sql(self, user_query: str, user_id: int) -> bool:
         """
@@ -382,6 +442,61 @@ Use the classify_intent function to provide your classification."""
             "provider_used": "fallback"
         }
 
+    def should_store_as_expense_text(self, user_text: str) -> bool:
+        """
+        Decide whether a plain user message should be saved as expense text.
+        Fully prompt-driven dynamic decision (no static keyword gating).
+        """
+        text = (user_text or "").strip()
+        if not text:
+            return False
+        logger.info("Storage decision: evaluating user text intent: '%s'", text)
+
+        category_list = ", ".join(self.expense_categories)
+        system_prompt = f"""You decide if a user's plain message should be saved as an expense entry in database.
+
+Expense categories:
+{category_list}
+
+Decision rules (strict):
+1. should_store=true only if user is stating/logging an expense/payment/amount actually spent.
+2. should_store=false for greetings, Q&A, follow-up questions, analysis queries, or general chat.
+3. If uncertain, prefer should_store=false.
+4. Choose category from provided list; if not clear, category=Other.
+5. Reply only through function call."""
+
+        user_message = f"""User message:
+"{text}"
+
+Decide storage now."""
+
+        try:
+            result = self.orchestrator.execute_with_fallback(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                functions=[CLASSIFY_STORAGE_DECISION_FUNCTION],
+                temperature=0.1,
+                max_tokens=300
+            )
+            if result.success and result.function_calls:
+                func_call = result.function_calls[0]
+                args = func_call.get("arguments", {})
+                if isinstance(args, str):
+                    args = json.loads(args)
+                should_store = bool(args.get("should_store", False))
+                confidence = float(args.get("confidence", 0.0) or 0.0)
+                logger.info(
+                    "Storage decision result: should_store=%s confidence=%.2f category=%s",
+                    should_store,
+                    confidence,
+                    args.get("category", "Other")
+                )
+                return should_store and confidence >= 0.55
+        except Exception:
+            logger.exception("Expense-text storage decision failed")
+
+        return False
+
     def generate_sql(self, user_query: str, user_id: int) -> Dict[str, Any]:
         """
         Step 2: Generate SQL using GPT-4o with function calling.
@@ -456,12 +571,17 @@ Exception:
 
 2. If query is about totals (SUM, COUNT, etc.)
    - Return aggregated values with clear aliases
-   - For full expense summary/overview queries, use:
+   - For full expense summary/overview queries (include manual text expenses too), use:
      SELECT
-       COUNT(*) as total_documents,
-       COALESCE(SUM(total_amount), 0) as total_amount,
+       (SELECT COUNT(*) FROM documents WHERE user_id = {user_id}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL) as total_documents,
+       COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL), 0) as total_amount,
        COUNT(DISTINCT vendor_name) as unique_vendors,
-       COALESCE(AVG(total_amount), 0) as avg_amount
+       (
+         COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL), 0)
+       ) / NULLIF(
+         (SELECT COUNT(*) FROM documents WHERE user_id = {user_id}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL),
+         0
+       ) as avg_amount
      FROM documents
      WHERE user_id = {user_id}
    - Do NOT return a single invoice row for summary/overview asks.
@@ -485,6 +605,18 @@ Exception:
    - Use: json_extract(extracted_data, '$.amounts.tax') as tax, json_extract(extracted_data, '$.amounts.subtotal') as subtotal
    - Example query for Amazon: SELECT json_extract(extracted_data, '$.amounts.tax') as tax, json_extract(extracted_data, '$.amounts.subtotal') as subtotal, vendor_name as vendor FROM documents WHERE user_id = {user_id} AND (vendor_name LIKE '%amazon%' OR vendor_name LIKE '%cloudtail%' OR vendor_name LIKE '%appario%')
    - Return: tax, subtotal, vendor
+
+6. If user asks rent-related totals ("room rent kitna", "rent total"):
+   - Include BOTH documents + user_text_entries amounts.
+   - Example:
+     SELECT
+       COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id} AND (LOWER(title) LIKE '%rent%' OR LOWER(vendor_name) LIKE '%rent%' OR LOWER(extracted_data) LIKE '%rent%')), 0) as document_rent_total,
+       COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL AND (LOWER(expense_category) = 'rent' OR LOWER(text) LIKE '%rent%' OR LOWER(text) LIKE '%kiraya%')), 0) as text_rent_total,
+       (
+         COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id} AND (LOWER(title) LIKE '%rent%' OR LOWER(vendor_name) LIKE '%rent%' OR LOWER(extracted_data) LIKE '%rent%')), 0)
+         +
+         COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL AND (LOWER(expense_category) = 'rent' OR LOWER(text) LIKE '%rent%' OR LOWER(text) LIKE '%kiraya%')), 0)
+       ) as total_rent
 
 Use the generate_sql_query function to provide your SQL."""
 
@@ -683,6 +815,26 @@ Generate one short assistant reply."""
                     "provider_used": "deterministic"
                 }
 
+        # Guardrail: deterministic rent total including manual text entries.
+        if self._is_rent_query(user_query):
+            sql = self._build_rent_total_sql(user_id)
+            exec_result = self.execute_query(sql, db_path)
+            if not exec_result.get("error"):
+                data = exec_result.get("rows", [])
+                ai_response = self._format_response(user_query, sql, data, user_id)
+                self._add_to_history(user_id, user_query, ai_response)
+                return {
+                    "success": True,
+                    "sql": sql,
+                    "explanation": "Deterministic rent total query across documents + user_text_entries",
+                    "error": None,
+                    "data": data,
+                    "row_count": exec_result.get("row_count", 0),
+                    "columns": exec_result.get("columns", []),
+                    "ai_response": ai_response,
+                    "provider_used": "deterministic"
+                }
+
         # Step 1: Intent Classification
         intent_analysis = self._understand_intent(user_query)
         logger.info(f"Intent analysis for '{user_query}': {intent_analysis}")
@@ -822,6 +974,16 @@ Generate one short assistant reply."""
             return (
                 f"Aapke {total_docs} expenses ka total ₹{total_amount:,.2f} hai. "
                 f"Average ₹{avg_amount:,.2f} per expense hai, aur {unique_vendors} unique vendors hain."
+            )
+        if data and len(data) == 1 and {"document_rent_total", "text_rent_total", "total_rent"}.issubset(set(data[0].keys())):
+            row = data[0]
+            doc_rent = float(row.get("document_rent_total") or 0)
+            txt_rent = float(row.get("text_rent_total") or 0)
+            total_rent = float(row.get("total_rent") or 0)
+            return (
+                f"Aapka total room rent ₹{total_rent:,.2f} hai.\n"
+                f"• Documents se: ₹{doc_rent:,.2f}\n"
+                f"• Aapke text entries se: ₹{txt_rent:,.2f}"
             )
 
         q = (user_query or "").lower()
@@ -1003,12 +1165,19 @@ Answer directly in a conversational way.{context}"""
             # Format results
             data = []
             for r in results:
+                if r.get("entry_type") == "user_text_entry":
+                    title = f"Text Entry #{r.get('text_entry_id')} (Score: {r['similarity_score']}%)"
+                    item_type = "user_text_entry"
+                else:
+                    title = f"Doc #{r['doc_id']} (Score: {r['similarity_score']}%)"
+                    item_type = "document"
                 data.append({
-                    "type": "document",
-                    "title": f"Doc #{r['doc_id']} (Score: {r['similarity_score']}%)",
+                    "type": item_type,
+                    "title": title,
                     "amount": None,
                     "vendor": None,
                     "date": None,
+                    "text_entry_id": r.get("text_entry_id"),
                     "_text": r["text"],
                     "_score": r["similarity_score"]
                 })
@@ -1048,20 +1217,46 @@ Answer directly in a conversational way.{context}"""
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
 
-                doc_ids = [r["doc_id"] for r in results]
-                placeholders = ",".join(["?"] * len(doc_ids))
-                cursor.execute(f"""
-                    SELECT id, document_type, title, total_amount, vendor_name, created_at, extracted_data
-                    FROM documents
-                    WHERE id IN ({placeholders}) AND user_id = ?
-                """, (*doc_ids, user_id))
+                doc_ids = [r["doc_id"] for r in results if r.get("entry_type") != "user_text_entry" and r.get("doc_id") is not None]
+                doc_details = {}
+                if doc_ids:
+                    placeholders = ",".join(["?"] * len(doc_ids))
+                    cursor.execute(f"""
+                        SELECT id, document_type, title, total_amount, vendor_name, created_at, extracted_data
+                        FROM documents
+                        WHERE id IN ({placeholders}) AND user_id = ?
+                    """, (*doc_ids, user_id))
+                    rows = cursor.fetchall()
+                    doc_details = {row["id"]: dict(row) for row in rows}
 
-                rows = cursor.fetchall()
-                doc_details = {row["id"]: dict(row) for row in rows}
+                text_entry_ids = [r["text_entry_id"] for r in results if r.get("entry_type") == "user_text_entry" and r.get("text_entry_id")]
+                text_entry_details = {}
+                if text_entry_ids:
+                    placeholders = ",".join(["?"] * len(text_entry_ids))
+                    cursor.execute(f"""
+                        SELECT id, text, amount, currency, expense_category, created_at
+                        FROM user_text_entries
+                        WHERE id IN ({placeholders}) AND user_id = ?
+                    """, (*text_entry_ids, user_id))
+                    rows = cursor.fetchall()
+                    text_entry_details = {row["id"]: dict(row) for row in rows}
                 conn.close()
 
                 for i, item in enumerate(data):
-                    doc_id = results[i]["doc_id"]
+                    result_row = results[i]
+                    if result_row.get("entry_type") == "user_text_entry":
+                        teid = result_row.get("text_entry_id")
+                        if teid in text_entry_details:
+                            t = text_entry_details[teid]
+                            item["type"] = "user_text_entry"
+                            item["title"] = f"Expense Note #{teid}"
+                            item["amount"] = t.get("amount")
+                            item["vendor"] = t.get("expense_category")
+                            item["date"] = t.get("created_at")
+                            item["raw_data"] = t.get("text")
+                        continue
+
+                    doc_id = result_row.get("doc_id")
                     if doc_id in doc_details:
                         d = doc_details[doc_id]
                         item.update({k: v for k, v in d.items() if v is not None})

@@ -34,7 +34,6 @@ OCR_MAX_INFLIGHT_PER_USER = int(os.getenv("OCR_MAX_INFLIGHT_PER_USER", "3"))
 if not OCR_QUEUE_AVAILABLE:
     logger.warning("Celery OCR queue is unavailable; using synchronous OCR fallback.")
 
-
 def _get_confidence(extracted_json: str) -> float:
     """Extract confidence score from OCR JSON result."""
     try:
@@ -377,6 +376,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     user_text = update.message.text.strip()
     chat_id = str(update.effective_chat.id)
+    logger.info("Incoming user message for intent check: '%s'", user_text)
     
     # Show typing indicator
     await context.bot.send_chat_action(
@@ -386,6 +386,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         # Use conversation memory if enabled
         use_memory = settings.CONVERSATION_MEMORY_ENABLED
+
+        if db_user and nlp_service_v2.should_store_as_expense_text(user_text):
+            try:
+                logger.info("Message classified as expense-related; saving text entry for user %s", db_user.id)
+                db_service.save_user_text_entry(
+                    user_id=db_user.id,
+                    user_text=user_text,
+                    intent_tag="expense_related_message"
+                )
+            except Exception:
+                logger.exception("Failed to persist expense-related user text for user %s", db_user.id)
         
         answer = await openai_service.ask(
             user_prompt=user_text,
@@ -447,6 +458,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         # Get the largest photo (best quality)
         photo = update.message.photo[-1]
+        user_input_text = (update.message.caption or "").strip() if update.message else ""
         telegram_file_id = photo.file_id
         telegram_file_unique_id = photo.file_unique_id
         file = await photo.get_file()
@@ -490,6 +502,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 file_size=file_size,
                 extracted_json="{}",
                 confidence_overall=None,
+                user_input_text=user_input_text or None,
                 source='telegram',
                 telegram_chat_id=update.effective_chat.id,
                 telegram_file_id=telegram_file_id,
@@ -511,7 +524,8 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             # Fallback to synchronous OCR when Celery is unavailable.
             result = await ocr_service.extract_data(
                 image_bytes=bytes(image_bytes),
-                mime_type="image/jpeg"
+                mime_type="image/jpeg",
+                user_input_text=user_input_text or None
             )
             duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, result)
             if duplicate_after_ocr:
@@ -529,6 +543,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 file_size=file_size,
                 extracted_json=result,
                 confidence_overall=confidence,
+                user_input_text=user_input_text or None,
                 source='telegram',
                 telegram_chat_id=update.effective_chat.id,
                 telegram_file_id=telegram_file_id,
@@ -599,6 +614,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         # Get file
         file = await document.get_file()
+        user_input_text = (update.message.caption or "").strip() if update.message else ""
         file_bytes = await file.download_as_bytearray()
         file_size = len(file_bytes)
         content_sha256 = hashlib.sha256(bytes(file_bytes)).hexdigest()
@@ -643,6 +659,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 file_size=file_size,
                 extracted_json="{}",
                 confidence_overall=None,
+                user_input_text=user_input_text or None,
                 source='telegram',
                 telegram_chat_id=update.effective_chat.id,
                 telegram_file_id=telegram_file_id,
@@ -663,7 +680,8 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else:
             result = await ocr_service.extract_data(
                 image_bytes=bytes(file_bytes),
-                mime_type=mime_type
+                mime_type=mime_type,
+                user_input_text=user_input_text or None
             )
             if mime_type.startswith("image/"):
                 duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, result)
@@ -682,6 +700,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 file_size=file_size,
                 extracted_json=result,
                 confidence_overall=confidence,
+                user_input_text=user_input_text or None,
                 source='telegram',
                 telegram_chat_id=update.effective_chat.id,
                 telegram_file_id=telegram_file_id,
@@ -806,6 +825,8 @@ async def query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Get the query from command args
     query_text = " ".join(context.args) if context.args else None
+    if query_text:
+        logger.info("Incoming /q user question: '%s'", query_text)
 
     if not query_text:
         await update.message.reply_text(

@@ -156,7 +156,11 @@ def process_pending_ocr(self, pending_id: int, user_id: int):
         bot = Bot(token=token)
         tg_file = await bot.get_file(file_id)
         file_bytes = await tg_file.download_as_bytearray()
-        return await ocr_service.extract_data(image_bytes=bytes(file_bytes), mime_type=mime_type or "image/jpeg")
+        return await ocr_service.extract_data(
+            image_bytes=bytes(file_bytes),
+            mime_type=mime_type or "image/jpeg",
+            user_input_text=pending.user_input_text
+        )
 
     try:
         result = _run(_extract_from_telegram_file(pending.telegram_file_id, pending.mime_type))

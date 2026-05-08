@@ -86,6 +86,8 @@ class Document(Base):
     vendor_name = Column(String(255), nullable=True)
     invoice_number = Column(String(100), nullable=True)
     gstin = Column(String(50), nullable=True)
+    expense_category = Column(String(50), nullable=True)
+    user_input_text = Column(Text, nullable=True)
     
     # Confidence score
     confidence_overall = Column(Float, nullable=True)
@@ -117,6 +119,8 @@ class Document(Base):
             "vendor_name": self.vendor_name,
             "invoice_number": self.invoice_number,
             "gstin": self.gstin,
+            "expense_category": self.expense_category,
+            "user_input_text": self.user_input_text,
             "confidence_overall": self.confidence_overall,
             "raw_text": self.raw_text,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -147,6 +151,7 @@ class PendingDocument(Base):
     
     # OCR extracted data (stored as JSON string)
     extracted_data = Column(Text, nullable=True)
+    user_input_text = Column(Text, nullable=True)
     
     # Confidence score
     confidence_overall = Column(Float, nullable=True)
@@ -185,6 +190,7 @@ class PendingDocument(Base):
             "mime_type": self.mime_type,
             "file_size": self.file_size,
             "extracted_data": json.loads(self.extracted_data) if self.extracted_data else None,
+            "user_input_text": self.user_input_text,
             "confidence_overall": self.confidence_overall,
             "telegram_chat_id": self.telegram_chat_id,
             "telegram_message_id": self.telegram_message_id,
@@ -200,11 +206,42 @@ class PendingDocument(Base):
         }
 
 
+class UserTextEntry(Base):
+    """User plain-text entries, especially expense-related intents."""
+    __tablename__ = "user_text_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    text = Column(Text, nullable=False)
+    intent_tag = Column(String(100), nullable=True)
+    expense_category = Column(String(50), nullable=True)
+    amount = Column(Float, nullable=True)
+    currency = Column(String(10), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "text": self.text,
+            "intent_tag": self.intent_tag,
+            "expense_category": self.expense_category,
+            "amount": self.amount,
+            "currency": self.currency,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 def init_db():
     """Initialize database - create all tables."""
     Base.metadata.create_all(bind=engine)
     _ensure_hash_columns()
     _ensure_pending_queue_columns()
+    _ensure_expense_category_columns()
+    _ensure_user_input_text_columns()
+    _ensure_user_text_entry_amount_columns()
     logger.info("Database initialized successfully")
 
 
@@ -243,6 +280,38 @@ def _ensure_pending_queue_columns():
         conn.commit()
 
 
+def _ensure_expense_category_columns():
+    """Add expense_category column on documents for existing DBs."""
+    with engine.connect() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(documents)"))}
+        if "expense_category" not in cols:
+            conn.execute(text("ALTER TABLE documents ADD COLUMN expense_category VARCHAR(50)"))
+        conn.commit()
+
+
+def _ensure_user_input_text_columns():
+    """Add user_input_text columns for persisted user-entered upload text."""
+    with engine.connect() as conn:
+        doc_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(documents)"))}
+        if "user_input_text" not in doc_cols:
+            conn.execute(text("ALTER TABLE documents ADD COLUMN user_input_text TEXT"))
+        pending_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(pending_documents)"))}
+        if "user_input_text" not in pending_cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN user_input_text TEXT"))
+        conn.commit()
+
+
+def _ensure_user_text_entry_amount_columns():
+    """Add amount/currency columns on user_text_entries for existing DBs."""
+    with engine.connect() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(user_text_entries)"))}
+        if "amount" not in cols:
+            conn.execute(text("ALTER TABLE user_text_entries ADD COLUMN amount FLOAT"))
+        if "currency" not in cols:
+            conn.execute(text("ALTER TABLE user_text_entries ADD COLUMN currency VARCHAR(10)"))
+        conn.commit()
+
+
 def get_db():
     """Get database session."""
     db = SessionLocal()
@@ -254,6 +323,110 @@ def get_db():
 
 class DatabaseService:
     """Service class for database operations."""
+
+    EXPENSE_CATEGORIES = [
+        "Food and Dining",
+        "Groceries",
+        "Rent",
+        "Utilities",
+        "Fual",
+        "Shopping",
+        "Entertainment",
+        "Healthcare",
+        "Edication",
+        "Personal care",
+        "Subscription",
+        "EMI/Loans",
+        "Insurance",
+        "Investment",
+        "Travel",
+        "Savings",
+        "CAB/Taxi",
+        "Misecellaneous",
+        "Other",
+    ]
+
+    CATEGORY_KEYWORDS = {
+        "Food and Dining": ["restaurant", "food", "dining", "zomato", "swiggy", "cafe", "hotel", "meal"],
+        "Groceries": ["grocery", "groceries", "supermarket", "mart", "kirana", "vegetable", "milk", "provision"],
+        "Rent": ["rent", "landlord", "lease", "tenancy"],
+        "Utilities": ["electricity", "water bill", "internet", "wifi", "broadband", "gas bill", "utility", "phone bill", "mobile recharge"],
+        "Fual": ["fuel", "petrol", "diesel", "indianoil", "hpcl", "bpcl", "gas station"],
+        "Shopping": ["shopping", "store", "amazon", "flipkart", "retail", "purchase", "mall"],
+        "Entertainment": ["movie", "cinema", "netflix", "spotify", "hotstar", "game", "concert"],
+        "Healthcare": ["hospital", "clinic", "pharmacy", "medicine", "medical", "doctor", "lab test", "diagnostic"],
+        "Edication": ["school", "college", "tuition", "course", "education", "training", "book fee", "exam"],
+        "Personal care": ["salon", "spa", "cosmetic", "grooming", "personal care", "parlor"],
+        "Subscription": ["subscription", "renewal", "monthly plan", "membership", "saas", "icloud", "google one"],
+        "EMI/Loans": ["emi", "loan", "installment", "repayment", "finance charge"],
+        "Insurance": ["insurance", "premium", "policy", "lic"],
+        "Investment": ["investment", "mutual fund", "sip", "stock", "brokerage", "demat", "equity", "bond"],
+        "Travel": ["flight", "train", "bus", "hotel booking", "travel", "trip", "airlines", "irctc"],
+        "Savings": ["savings", "deposit", "fd", "rd", "recurring deposit", "piggy"],
+        "CAB/Taxi": ["cab", "taxi", "uber", "ola", "rapido", "auto fare"],
+        "Misecellaneous": ["misc", "miscellaneous", "others", "general expense"],
+    }
+
+    @staticmethod
+    def _extract_classification_text(data: dict, raw_text: Optional[str], file_name: Optional[str]) -> str:
+        amounts = data.get("amounts", {}) if isinstance(data.get("amounts"), dict) else {}
+        vendor = data.get("vendor_or_sender", {}) if isinstance(data.get("vendor_or_sender"), dict) else {}
+        items = data.get("items", []) if isinstance(data.get("items"), list) else []
+        parts = [
+            str(data.get("title") or ""),
+            str(data.get("document_type") or ""),
+            str(data.get("date") or ""),
+            str(vendor.get("name") or data.get("vendor_name") or ""),
+            str(raw_text or ""),
+            str(data.get("text_content") or ""),
+            str(file_name or ""),
+            str(amounts.get("currency") or ""),
+        ]
+        for item in items[:25]:
+            if isinstance(item, dict):
+                parts.append(str(item.get("description") or item.get("name") or ""))
+        merged = " ".join(parts)
+        return re.sub(r"\s+", " ", merged).strip().lower()
+
+    @staticmethod
+    def _classify_expense_category(data: dict, raw_text: Optional[str], file_name: Optional[str]) -> str:
+        text_blob = DatabaseService._extract_classification_text(data, raw_text, file_name)
+        if not text_blob:
+            return "Other"
+
+        # Score each category by keyword hits and choose the strongest intent.
+        best_category = "Other"
+        best_score = 0
+        for category, keywords in DatabaseService.CATEGORY_KEYWORDS.items():
+            score = sum(1 for kw in keywords if kw in text_blob)
+            if score > best_score:
+                best_score = score
+                best_category = category
+        return best_category if best_category in DatabaseService.EXPENSE_CATEGORIES else "Other"
+
+    @staticmethod
+    def classify_text_to_expense_category(user_text: str) -> str:
+        """Classify plain user text into one of configured expense categories."""
+        data = {"text_content": user_text}
+        return DatabaseService._classify_expense_category(data, user_text, None)
+
+    @staticmethod
+    def _extract_amount_from_text(user_text: str) -> Optional[float]:
+        """Extract a likely expense amount from free text (supports 8,000 / 8000.50)."""
+        if not user_text:
+            return None
+        # Prefer larger numbers first; treat simple integers/decimals as INR by default.
+        matches = re.findall(r"(?:₹|rs\.?|inr)?\s*([0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]+(?:\.[0-9]{1,2})?)", user_text, flags=re.IGNORECASE)
+        candidates: List[float] = []
+        for m in matches:
+            try:
+                candidates.append(float(m.replace(",", "")))
+            except Exception:
+                continue
+        if not candidates:
+            return None
+        # Heuristic: pick the largest monetary number in message.
+        return max(candidates)
 
     @staticmethod
     def get_or_create_user(telegram_id: int, first_name: Optional[str], 
@@ -300,6 +473,7 @@ class DatabaseService:
     def save_document(user_id: int, file_name: Optional[str], mime_type: Optional[str],
                       file_size: Optional[int], extracted_json: str,
                       raw_text: Optional[str] = None,
+                      user_input_text: Optional[str] = None,
                       telegram_file_unique_id: Optional[str] = None,
                       content_sha256: Optional[str] = None,
                       dhash: Optional[str] = None,
@@ -318,6 +492,8 @@ class DatabaseService:
             vendor = data.get("vendor_or_sender", {})
             identifiers = data.get("identifiers", {})
             confidence = data.get("confidence", {})
+            merged_input_text = " ".join([x for x in [raw_text, user_input_text] if x]).strip() or None
+            classified_category = DatabaseService._classify_expense_category(data, merged_input_text, file_name)
 
             doc = Document(
                 user_id=user_id,
@@ -337,6 +513,8 @@ class DatabaseService:
                 vendor_name=vendor.get("name"),
                 invoice_number=identifiers.get("invoice_number"),
                 gstin=identifiers.get("gstin"),
+                expense_category=classified_category,
+                user_input_text=user_input_text,
                 confidence_overall=confidence.get("overall"),
                 raw_text=raw_text or data.get("text_content")
             )
@@ -356,6 +534,8 @@ class DatabaseService:
                     "document_type": doc.document_type,
                     "title": doc.title,
                     "vendor_name": doc.vendor_name,
+                    "expense_category": doc.expense_category,
+                    "user_input_text": doc.user_input_text,
                     "total_amount": doc.total_amount,
                     "extracted_json": doc.extracted_data,
                     "document_date": doc.document_date,
@@ -369,6 +549,48 @@ class DatabaseService:
         except Exception as e:
             db.rollback()
             logger.error(f"Database error in save_document: {e}")
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def save_user_text_entry(user_id: int, user_text: str, intent_tag: str = "expense_text") -> Optional[UserTextEntry]:
+        """Persist expense-related user text and index it in vector DB."""
+        db = get_db()
+        try:
+            cleaned = (user_text or "").strip()
+            if not cleaned:
+                return None
+            category = DatabaseService.classify_text_to_expense_category(cleaned)
+            amount = DatabaseService._extract_amount_from_text(cleaned)
+            entry = UserTextEntry(
+                user_id=user_id,
+                text=cleaned,
+                intent_tag=intent_tag,
+                expense_category=category,
+                amount=amount,
+                currency="INR" if amount is not None else None
+            )
+            db.add(entry)
+            db.commit()
+            db.refresh(entry)
+
+            try:
+                vector_service = get_vector_service()
+                vector_service.add_user_text_entry(
+                    entry_id=entry.id,
+                    user_id=user_id,
+                    text=cleaned,
+                    intent_tag=intent_tag
+                )
+            except Exception as e:
+                logger.warning(f"Failed to add text entry {entry.id} to vector DB (non-critical): {e}")
+
+            logger.info(f"Saved user text entry: id={entry.id}, user_id={user_id}, category={category}")
+            return entry
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Database error in save_user_text_entry: {e}")
             raise
         finally:
             db.close()
@@ -454,6 +676,7 @@ class DatabaseService:
     def create_pending_document(user_id: int, file_name: Optional[str], mime_type: Optional[str],
                                 file_size: Optional[int], extracted_json: str,
                                 confidence_overall: Optional[float] = None,
+                                user_input_text: Optional[str] = None,
                                 source: str = 'web',
                                 telegram_chat_id: Optional[int] = None,
                                 telegram_message_id: Optional[int] = None,
@@ -485,6 +708,7 @@ class DatabaseService:
                 dhash=dhash,
                 phash=phash,
                 extracted_data=extracted_json,
+                user_input_text=user_input_text,
                 confidence_overall=confidence_overall,
                 telegram_chat_id=telegram_chat_id,
                 telegram_message_id=telegram_message_id,
@@ -576,6 +800,7 @@ class DatabaseService:
                 mime_type=pending.mime_type,
                 file_size=pending.file_size,
                 extracted_json=pending.extracted_data,
+                user_input_text=pending.user_input_text,
                 telegram_file_unique_id=pending.telegram_file_unique_id,
                 content_sha256=pending.content_sha256,
                 dhash=pending.dhash,
