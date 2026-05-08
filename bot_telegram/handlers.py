@@ -2,18 +2,37 @@ import io
 import json
 import logging
 import time
+import hashlib
+import os
+from typing import Any, Dict, List
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
 from shared.openai_client import OpenAIService
 from shared.database import DatabaseService
-from shared.nlp_sql_service import get_nlp_sql_service
+from shared.nlp_sql_service_v2 import get_nlp_sql_service_v2
+from shared.rag_service import get_rag_service
 from shared.ocr_service import get_ocr_service
+from shared.image_hash_service import generate_image_hashes
 from bot_telegram.config import settings
+
+try:
+    from shared.tasks.ocr_tasks import process_pending_ocr
+    OCR_QUEUE_AVAILABLE = True
+except Exception:
+    process_pending_ocr = None
+    OCR_QUEUE_AVAILABLE = False
 
 logger = logging.getLogger("telegram_handlers")
 openai_service = OpenAIService()
 db_service = DatabaseService()
 ocr_service = get_ocr_service()
+
+# New orchestrated services with GPT-4o primary + Anthropic fallback
+nlp_service_v2 = get_nlp_sql_service_v2()
+rag_service = get_rag_service()
+OCR_MAX_INFLIGHT_PER_USER = int(os.getenv("OCR_MAX_INFLIGHT_PER_USER", "3"))
+if not OCR_QUEUE_AVAILABLE:
+    logger.warning("Celery OCR queue is unavailable; using synchronous OCR fallback.")
 
 
 def _get_confidence(extracted_json: str) -> float:
@@ -31,6 +50,120 @@ def _get_confidence(extracted_json: str) -> float:
         return 1.0  # Default to high confidence if not specified
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return 0.0  # Low confidence if we can't parse
+
+
+def _safe_json_loads(extracted_json: str) -> dict:
+    """Parse OCR JSON safely and return dict."""
+    try:
+        parsed = json.loads(extracted_json)
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _compact_ocr_payload_for_summary(extracted_json: str) -> Dict[str, Any]:
+    """Prepare compact OCR payload for dynamic UI summarization."""
+    data = _safe_json_loads(extracted_json)
+    data.pop("tables", None)
+    data.pop("confidence", None)
+    data.pop("_ocr_metadata", None)
+
+    amounts = data.get("amounts") if isinstance(data.get("amounts"), dict) else {}
+    vendor_block = data.get("vendor_or_sender") if isinstance(data.get("vendor_or_sender"), dict) else {}
+    identifiers = data.get("identifiers") if isinstance(data.get("identifiers"), dict) else {}
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+
+    fields: Dict[str, Any] = {
+        "document_type": data.get("document_type"),
+        "title": data.get("title"),
+        "date": data.get("date") or data.get("document_date"),
+        "vendor": data.get("vendor_name") or data.get("vendor") or vendor_block.get("name"),
+        "vendor_address": vendor_block.get("address") or data.get("address"),
+        "invoice_number": data.get("invoice_number") or identifiers.get("invoice_number"),
+        "gstin": data.get("gstin") or identifiers.get("gstin") or vendor_block.get("gstin"),
+        "currency": data.get("currency") or amounts.get("currency"),
+        "total_amount": data.get("total_amount") or amounts.get("total"),
+        "subtotal": amounts.get("subtotal") or data.get("subtotal"),
+        "tax_amount": amounts.get("tax") or data.get("tax"),
+        "cgst": amounts.get("cgst") or data.get("cgst"),
+        "sgst": amounts.get("sgst") or data.get("sgst"),
+        "igst": amounts.get("igst") or data.get("igst"),
+    }
+    compact_fields = {k: v for k, v in fields.items() if v not in (None, "", [], {})}
+
+    compact_items: List[Dict[str, Any]] = []
+    for item in items[:15]:
+        if not isinstance(item, dict):
+            continue
+        clean_item = {
+            "description": item.get("description") or item.get("name"),
+            "quantity": item.get("quantity"),
+            "unit_price": item.get("price"),
+            "amount": item.get("amount") or item.get("total"),
+        }
+        clean_item = {k: v for k, v in clean_item.items() if v not in (None, "", [], {})}
+        if clean_item:
+            compact_items.append(clean_item)
+
+    return {"fields": compact_fields, "items": compact_items}
+
+
+async def _build_upload_preview_card(extracted_json: str, confidence: float, doc_label: str, file_name: str = "") -> str:
+    """
+    Build dynamic OCR summary card through GPT.
+    Only shows available data; hides missing keys automatically.
+    """
+    is_high_conf = confidence > 0.8
+
+    compact_payload = _compact_ocr_payload_for_summary(extracted_json)
+    payload_json = json.dumps(compact_payload, ensure_ascii=False, indent=2)
+
+    system_prompt = """You create concise OCR summary cards for Telegram in Markdown.
+
+Rules:
+1. Use only provided data. Never invent missing values.
+2. Skip missing fields entirely (do not print N/A).
+3. Keep response compact and readable.
+4. If items exist, include bullet points with qty/unit/amount only when present.
+5. Do not include these labels in output: "Image OCR Summary Card", "Confidence", "File", "Unordered List".
+6. Do not include JSON, code blocks, or technical metadata."""
+
+    user_prompt = f"""Generate only the card body.
+
+Data:
+{payload_json}"""
+
+    try:
+        llm_summary = await openai_service.ask(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            use_memory=False
+        )
+    except Exception:
+        llm_summary = ""
+
+    llm_summary = (llm_summary or "").strip()
+    if not llm_summary:
+        # Deterministic fallback with dynamic fields only.
+        fields = compact_payload.get("fields", {})
+        items = compact_payload.get("items", [])
+        lines: List[str] = [f"**{k.replace('_', ' ').title()}:** {v}" for k, v in fields.items()]
+        if items:
+            lines.append("")
+            for idx, item in enumerate(items, 1):
+                parts = [str(item.get("description", f"Item {idx}"))]
+                if "quantity" in item:
+                    parts.append(f"qty: {item['quantity']}")
+                if "unit_price" in item:
+                    parts.append(f"unit: {item['unit_price']}")
+                if "amount" in item:
+                    parts.append(f"amount: {item['amount']}")
+                lines.append(f"• {' | '.join(parts)}")
+        llm_summary = "\n".join(lines) if lines else "_No extractable fields found._"
+
+    # Telegram doesn't support true border colors; use green/orange themed border lines.
+    border = "🟢────────────────────────" if is_high_conf else "🟠────────────────────────"
+    return f"{border}\n{llm_summary}\n{border}"
 
 
 def _get_or_create_user(update: Update):
@@ -162,7 +295,13 @@ async def clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     chat_id = str(update.effective_chat.id)
     openai_service.clear_conversation(chat_id)
-    await update.message.reply_text("Conversation memory cleared!")
+    db_user = _get_or_create_user(update)
+    if db_user:
+        try:
+            nlp_service_v2.clear_user_history(db_user.id)
+        except Exception:
+            logger.exception("Failed clearing NLP SQL history for user %s", db_user.id)
+    await update.message.reply_text("Conversation memory cleared (OpenAI + /q context).")
 
 
 async def websearch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -308,51 +447,108 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         # Get the largest photo (best quality)
         photo = update.message.photo[-1]
+        telegram_file_id = photo.file_id
+        telegram_file_unique_id = photo.file_unique_id
         file = await photo.get_file()
 
         # Download image bytes
         image_bytes = await file.download_as_bytearray()
         file_size = len(image_bytes)
+        content_sha256 = hashlib.sha256(bytes(image_bytes)).hexdigest()
+        dhash, phash = generate_image_hashes(bytes(image_bytes))
+
+        duplicate = db_service.find_duplicate_image_for_user(
+            db_user.id,
+            telegram_file_unique_id=telegram_file_unique_id,
+            content_sha256=content_sha256,
+            dhash=dhash,
+            phash=phash
+        )
+        if duplicate:
+            await update.message.reply_text(
+                "⚠️ Duplicate image detected.\n"
+                "Ye image aap pehle hi upload kar chuke ho. Naya save nahi kiya gaya."
+            )
+            return
 
         logger.info(f"Processing photo from user {db_user.telegram_id} (@{db_user.username}), size: {file_size} bytes")
 
-        # Extract data using OCR (Gemini 2.5 Flash + Claude Opus 4.5)
-        result = await ocr_service.extract_data(
-            image_bytes=bytes(image_bytes),
-            mime_type="image/jpeg"
-        )
+        inflight = db_service.count_user_inflight_pending_documents(db_user.id)
+        if inflight >= OCR_MAX_INFLIGHT_PER_USER:
+            await update.message.reply_text(
+                f"⚠️ Aapke {inflight} OCR jobs already processing me hain.\n"
+                "Thoda wait karke fir upload karein."
+            )
+            return
 
-        # Check confidence score
-        confidence = _get_confidence(result)
+        if OCR_QUEUE_AVAILABLE and process_pending_ocr is not None:
+            # Store processing document in database before queueing
+            pending = db_service.create_pending_document(
+                user_id=db_user.id,
+                file_name="photo.jpg",
+                mime_type="image/jpeg",
+                file_size=file_size,
+                extracted_json="{}",
+                confidence_overall=None,
+                source='telegram',
+                telegram_chat_id=update.effective_chat.id,
+                telegram_file_id=telegram_file_id,
+                telegram_file_unique_id=telegram_file_unique_id,
+                content_sha256=content_sha256,
+                dhash=dhash,
+                phash=phash,
+                status='processing'
+            )
+            job = process_pending_ocr.delay(pending.id, db_user.id)
+            db_service.set_pending_job_id(pending.id, job.id)
 
-        # Store pending document in database
-        pending = db_service.create_pending_document(
-            user_id=db_user.id,
-            file_name="photo.jpg",
-            mime_type="image/jpeg",
-            file_size=file_size,
-            extracted_json=result,
-            confidence_overall=confidence,
-            source='telegram',
-            telegram_chat_id=update.effective_chat.id
-        )
-
-        # Show data with edit/confirm buttons
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirm & Save", callback_data=f"confirm:{pending.id}")],
-            [InlineKeyboardButton("✏️ Edit Data", callback_data=f"edit:{pending.id}")]
-        ])
-
-        if confidence < 0.8:
-            header = f"⚠️ **Low Confidence: {confidence:.0%}**\n📸 **Image Analysis**\n\n"
+            ack = await update.message.reply_text(
+                "Upload received. OCR processing started in background.\n"
+                "Result aate hi confirm/edit buttons ke saath message aa jayega."
+            )
+            db_service.set_pending_telegram_message_id(pending.id, ack.message_id)
         else:
-            header = f"📸 **Image Analysis**\n✅ **Confidence: {confidence:.0%}**\n\n"
-        
-        await update.message.reply_text(
-            header + f"```json\n{result}\n```",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+            # Fallback to synchronous OCR when Celery is unavailable.
+            result = await ocr_service.extract_data(
+                image_bytes=bytes(image_bytes),
+                mime_type="image/jpeg"
+            )
+            duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, result)
+            if duplicate_after_ocr:
+                await update.message.reply_text(
+                    "⚠️ Duplicate image detected.\n"
+                    "Ye document pehle se hai (content match mila), naya save nahi kiya gaya."
+                )
+                return
+
+            confidence = _get_confidence(result)
+            pending = db_service.create_pending_document(
+                user_id=db_user.id,
+                file_name="photo.jpg",
+                mime_type="image/jpeg",
+                file_size=file_size,
+                extracted_json=result,
+                confidence_overall=confidence,
+                source='telegram',
+                telegram_chat_id=update.effective_chat.id,
+                telegram_file_id=telegram_file_id,
+                telegram_file_unique_id=telegram_file_unique_id,
+                content_sha256=content_sha256,
+                dhash=dhash,
+                phash=phash,
+                status='pending'
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm & Save", callback_data=f"confirm:{pending.id}")],
+                [InlineKeyboardButton("✏️ Edit Data", callback_data=f"edit:{pending.id}")]
+            ])
+            preview_card = await _build_upload_preview_card(
+                extracted_json=result,
+                confidence=confidence,
+                doc_label="Image",
+                file_name="photo.jpg"
+            )
+            await update.message.reply_text(preview_card, reply_markup=keyboard, parse_mode="Markdown")
 
         latency = time.time() - start_time
         logger.info(f"Photo processed for user {db_user.telegram_id} in {latency:.2f}s, awaiting confirmation")
@@ -383,6 +579,8 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     document = update.message.document
     mime_type = document.mime_type or ""
     file_name = document.file_name or "document"
+    telegram_file_id = document.file_id
+    telegram_file_unique_id = document.file_unique_id
 
     # Only process images and PDFs
     allowed_types = ["image/jpeg", "image/png", "image/webp", "application/pdf"]
@@ -403,49 +601,107 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         file = await document.get_file()
         file_bytes = await file.download_as_bytearray()
         file_size = len(file_bytes)
+        content_sha256 = hashlib.sha256(bytes(file_bytes)).hexdigest()
+        dhash = None
+        phash = None
+
+        if mime_type.startswith("image/"):
+            dhash, phash = generate_image_hashes(bytes(file_bytes))
+            duplicate = db_service.find_duplicate_image_for_user(
+                db_user.id,
+                telegram_file_unique_id=telegram_file_unique_id,
+                content_sha256=content_sha256,
+                dhash=dhash,
+                phash=phash
+            )
+            if duplicate:
+                await update.message.reply_text(
+                    "⚠️ Duplicate image detected.\n"
+                    "Ye image aap pehle hi upload kar chuke ho. Naya save nahi kiya gaya."
+                )
+                return
 
         logger.info(f"Processing document from user {db_user.telegram_id} (@{db_user.username}): {file_name}, size: {file_size} bytes")
 
         # For PDFs, note that GPT-4 Vision works best with image-based PDFs
         display_type = "PDF" if mime_type == "application/pdf" else "Image"
 
-        # Extract data using OCR (Gemini 2.5 Flash + Claude Opus 4.5)
-        result = await ocr_service.extract_data(
-            image_bytes=bytes(file_bytes),
-            mime_type=mime_type
-        )
+        inflight = db_service.count_user_inflight_pending_documents(db_user.id)
+        if inflight >= OCR_MAX_INFLIGHT_PER_USER:
+            await update.message.reply_text(
+                f"⚠️ Aapke {inflight} OCR jobs already processing me hain.\n"
+                "Thoda wait karke fir upload karein."
+            )
+            return
 
-        # Check confidence score
-        confidence = _get_confidence(result)
+        if OCR_QUEUE_AVAILABLE and process_pending_ocr is not None:
+            # Store pending document in database
+            pending = db_service.create_pending_document(
+                user_id=db_user.id,
+                file_name=file_name,
+                mime_type=mime_type,
+                file_size=file_size,
+                extracted_json="{}",
+                confidence_overall=None,
+                source='telegram',
+                telegram_chat_id=update.effective_chat.id,
+                telegram_file_id=telegram_file_id,
+                telegram_file_unique_id=telegram_file_unique_id,
+                content_sha256=content_sha256,
+                dhash=dhash,
+                phash=phash,
+                status='processing'
+            )
+            job = process_pending_ocr.delay(pending.id, db_user.id)
+            db_service.set_pending_job_id(pending.id, job.id)
 
-        # Store pending document in database
-        pending = db_service.create_pending_document(
-            user_id=db_user.id,
-            file_name=file_name,
-            mime_type=mime_type,
-            file_size=file_size,
-            extracted_json=result,
-            confidence_overall=confidence,
-            source='telegram',
-            telegram_chat_id=update.effective_chat.id
-        )
-
-        # Show data with edit/confirm buttons
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirm & Save", callback_data=f"confirm:{pending.id}")],
-            [InlineKeyboardButton("✏️ Edit Data", callback_data=f"edit:{pending.id}")]
-        ])
-
-        if confidence < 0.8:
-            header = f"⚠️ **Low Confidence: {confidence:.0%}**\n📄 **{display_type} Analysis**\n_File: {file_name}_\n\n"
+            ack = await update.message.reply_text(
+                f"{display_type} upload received. OCR processing started in background.\n"
+                "Result aate hi confirm/edit buttons ke saath message aa jayega."
+            )
+            db_service.set_pending_telegram_message_id(pending.id, ack.message_id)
         else:
-            header = f"📄 **{display_type} Analysis**\n✅ **Confidence: {confidence:.0%}**\n_File: {file_name}_\n\n"
-        
-        await update.message.reply_text(
-            header + f"```json\n{result}\n```",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+            result = await ocr_service.extract_data(
+                image_bytes=bytes(file_bytes),
+                mime_type=mime_type
+            )
+            if mime_type.startswith("image/"):
+                duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, result)
+                if duplicate_after_ocr:
+                    await update.message.reply_text(
+                        "⚠️ Duplicate image detected.\n"
+                        "Ye document pehle se मौजूद hai (content match mila), naya save nahi kiya gaya."
+                    )
+                    return
+
+            confidence = _get_confidence(result)
+            pending = db_service.create_pending_document(
+                user_id=db_user.id,
+                file_name=file_name,
+                mime_type=mime_type,
+                file_size=file_size,
+                extracted_json=result,
+                confidence_overall=confidence,
+                source='telegram',
+                telegram_chat_id=update.effective_chat.id,
+                telegram_file_id=telegram_file_id,
+                telegram_file_unique_id=telegram_file_unique_id,
+                content_sha256=content_sha256,
+                dhash=dhash,
+                phash=phash,
+                status='pending'
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm & Save", callback_data=f"confirm:{pending.id}")],
+                [InlineKeyboardButton("✏️ Edit Data", callback_data=f"edit:{pending.id}")]
+            ])
+            preview_card = await _build_upload_preview_card(
+                extracted_json=result,
+                confidence=confidence,
+                doc_label=display_type,
+                file_name=file_name
+            )
+            await update.message.reply_text(preview_card, reply_markup=keyboard, parse_mode="Markdown")
 
         latency = time.time() - start_time
         logger.info(f"Document processed for user {db_user.telegram_id} in {latency:.2f}s, awaiting confirmation")
@@ -476,24 +732,54 @@ async def mydocs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if not docs:
             await update.message.reply_text(
-                "📄 **Your Documents**\n\nYou haven't uploaded any documents yet.\n"
-                "Send me an image or PDF to extract data!"
+                "📄 **Your Documents**\n\n"
+                "Abhi tak koi document upload nahi hua.\n"
+                "Image ya PDF bhejo, main turant extract karke save kar dunga 😊"
             )
             return
 
-        # Build response
-        lines = ["📄 **Your Documents**\n"]
+        # Build summarized + detailed response
+        total_docs = len(docs)
+        total_amount = sum((doc.total_amount or 0) for doc in docs)
+        image_count = sum(1 for doc in docs if doc.mime_type and doc.mime_type.startswith("image"))
+        pdf_count = total_docs - image_count
+        avg_amount = (total_amount / total_docs) if total_docs else 0
+        vendor_totals = {}
         for doc in docs:
-            doc_type = "📸" if doc.mime_type and doc.mime_type.startswith("image") else "📄"
+            vendor = doc.vendor_name or "Unknown"
+            vendor_totals[vendor] = vendor_totals.get(vendor, 0) + (doc.total_amount or 0)
+        top_vendor, top_vendor_amount = max(vendor_totals.items(), key=lambda x: x[1]) if vendor_totals else ("N/A", 0)
+
+        lines = [
+            "╔════════════════════╗",
+            "📊 **DOCUMENT SNAPSHOT (🆕 v2)**",
+            "╚════════════════════╝",
+            "",
+            f"📄 **Docs:** {total_docs}",
+            f"💰 **Total Spend:** ₹{total_amount:,.2f}",
+            f"📸 **Images/PDFs:** {image_count}/{pdf_count}",
+            f"📈 **Avg per Doc:** ₹{avg_amount:,.2f}",
+            f"🏪 **Top Vendor:** {top_vendor}",
+            f"   └ ₹{top_vendor_amount:,.2f}",
+            "",
+            f"🗂️ **Recent {min(total_docs, 20)} Documents**"
+        ]
+
+        for idx, doc in enumerate(docs[:20], 1):
+            doc_type = "📸" if doc.mime_type and doc.mime_type.startswith("image") else "📑"
             title = doc.title or doc.file_name or "Untitled"
-            amount = f"₹{doc.total_amount:.2f}" if doc.total_amount else "N/A"
+            short_title = title[:36] + "..." if len(title) > 36 else title
+            amount = f"₹{doc.total_amount:,.2f}" if doc.total_amount else "N/A"
             date = doc.document_date or "N/A"
+            created = doc.created_at.strftime('%d %b %Y, %I:%M %p')
             lines.append(
-                f"{doc_type} **ID: {doc.id}** | {title[:30]}{'...' if len(title) > 30 else ''}\n"
-                f"   Amount: {amount} | Date: {date} | {doc.created_at.strftime('%Y-%m-%d %H:%M')}\n"
+                f"\n**{idx})** {doc_type} **{short_title}**\n"
+                f"🆔 `{doc.id}`   💰 {amount}\n"
+                f"📅 {date}   🕒 {created}"
             )
 
-        lines.append(f"\n_Total: {len(docs)} documents_")
+        if total_docs > 20:
+            lines.append(f"\n_...and {total_docs - 20} more documents_")
 
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         logger.info(f"User {db_user.telegram_id} viewed {len(docs)} documents")
@@ -540,9 +826,8 @@ async def query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
     try:
-        # Use NLP SQL service which has intent routing built-in
-        nlp_service = get_nlp_sql_service()
-        result = nlp_service.ask_ai(query_text, db_user.id)
+        # Use new NLP SQL v2 service with GPT-4o + Anthropic fallback via orchestrator
+        result = nlp_service_v2.ask_ai(query_text, db_user.id)
 
         # Format response based on result
         if result.get("success"):
@@ -624,7 +909,14 @@ async def query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 # SQL query results - use LLM-generated summary
                 ai_response = result.get("ai_response")
                 if ai_response:
-                    await update.message.reply_text(ai_response, parse_mode="Markdown")
+                    try:
+                        await update.message.reply_text(ai_response, parse_mode="Markdown")
+                    except BadRequest as e:
+                        # Fallback to plain text if Markdown parsing fails
+                        if "parse entities" in str(e).lower():
+                            await update.message.reply_text(ai_response)
+                        else:
+                            raise
                 else:
                     await update.message.reply_text("📊 Query executed successfully but no summary available.")
         else:
@@ -665,23 +957,63 @@ async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         # Get user summary stats
         stats = db_service.get_user_summary_stats(db_user.id)
+        docs = db_service.get_user_documents(db_user.id, limit=20)
 
-        # Build formatted response
-        lines = ["📊 **Your Document Summary**\n"]
-        lines.append(f"📄 **Total Documents:** {stats['total_documents']}")
-        lines.append(f"💰 **Total Amount:** ₹{stats['total_amount']:.2f}")
-        lines.append(f"🏪 **Unique Vendors:** {stats['unique_vendors']}")
+        if not docs:
+            await update.message.reply_text(
+                "📄 **Your Documents**\n\n"
+                "Abhi tak koi document upload nahi hua.\n"
+                "Image ya PDF bhejo, main turant extract karke save kar dunga 😊"
+            )
+            return
+
+        # Build summary + detailed response (same style as /mydocs)
+        total_docs = stats.get("total_documents", len(docs))
+        total_amount = stats.get("total_amount", 0.0)
+        image_count = sum(1 for doc in docs if doc.mime_type and doc.mime_type.startswith("image"))
+        pdf_count = total_docs - image_count
+        avg_amount = (total_amount / total_docs) if total_docs else 0
+
+        vendor_totals = {}
+        for doc in docs:
+            vendor = doc.vendor_name or "Unknown"
+            vendor_totals[vendor] = vendor_totals.get(vendor, 0) + (doc.total_amount or 0)
+        top_vendor, top_vendor_amount = max(vendor_totals.items(), key=lambda x: x[1]) if vendor_totals else ("N/A", 0)
+
+        lines = [
+            "📊 **Your Document Summary**",
+            "",
+            (
+                f"Aapke paas **{total_docs} documents** hain jinka total amount "
+                f"**₹{total_amount:,.2f}** hai. Average per document **₹{avg_amount:,.2f}** "
+                f"raha, aur sabse bada vendor contribution **{top_vendor} (₹{top_vendor_amount:,.2f})** ka hai."
+            ),
+            (
+                f"Document mix: **{image_count} images** aur **{pdf_count} PDFs**, "
+                f"with **{stats.get('unique_vendors', 0)} unique vendors**."
+            ),
+        ]
 
         if stats['document_types']:
-            lines.append("\n📁 **Document Types:**")
+            lines.append("\n📁 **Type Breakdown:**")
             for dt in stats['document_types']:
-                lines.append(f"  • {dt['type']}: {dt['count']}")
+                lines.append(f"• {dt['type']}: {dt['count']}")
 
-        if stats['recent_documents']:
-            lines.append("\n🕒 **Recent Documents:**")
-            for i, doc in enumerate(stats['recent_documents'][:5], 1):
-                amount_str = f" (₹{doc['amount']:.2f})" if doc['amount'] else ""
-                lines.append(f"  {i}. {doc['title']}{amount_str}")
+        lines.append("")
+        lines.append(f"🗂️ **Recent Documents ({min(total_docs, 20)})**")
+        for idx, doc in enumerate(docs[:20], 1):
+            doc_type = "📸" if doc.mime_type and doc.mime_type.startswith("image") else "📑"
+            title = doc.title or doc.file_name or "Untitled"
+            short_title = title[:36] + "..." if len(title) > 36 else title
+            amount = f"₹{doc.total_amount:,.2f}" if doc.total_amount else "N/A"
+            date = doc.document_date or "N/A"
+            created = doc.created_at.strftime('%d %b %Y, %I:%M %p')
+            lines.append(
+                f"{idx}. {doc_type} **{short_title}** — {amount} | {date} | {created}"
+            )
+
+        if total_docs > 20:
+            lines.append(f"\n_...and {total_docs - 20} more documents_")
 
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -716,10 +1048,16 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text("❌ Failed to save document. Please try again.")
             return
 
-        # Update message
+        confidence = pending.confidence_overall if pending.confidence_overall is not None else _get_confidence(pending.extracted_data)
+        saved_card = await _build_upload_preview_card(
+            extracted_json=pending.extracted_data,
+            confidence=confidence,
+            doc_label="Saved Document",
+            file_name=pending.file_name or ""
+        )
+
         await query.edit_message_text(
-            f"✅ **Document Saved**\n📄 Document ID: `{doc.id}`\n\n"
-            f"```json\n{pending.extracted_data}\n```",
+            f"✅ **Document Saved**\n\n{saved_card}",
             parse_mode="Markdown"
         )
 
@@ -793,9 +1131,16 @@ async def edit_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ Failed to save document. Please try again.")
             return
 
+        corrected_confidence = _get_confidence(corrected_json)
+        corrected_card = await _build_upload_preview_card(
+            extracted_json=corrected_json,
+            confidence=corrected_confidence,
+            doc_label="Corrected Document",
+            file_name=pending.file_name or ""
+        )
+
         await update.message.reply_text(
-            f"✅ **Corrected Document Saved**\n📄 Document ID: `{doc.id}`\n\n"
-            f"```json\n{corrected_json}\n```",
+            f"✅ **Corrected Document Saved**\n📄 Document ID: `{doc.id}`\n\n{corrected_card}",
             parse_mode="Markdown"
         )
 

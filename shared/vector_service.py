@@ -11,7 +11,7 @@ import os
 import json
 import logging
 from typing import List, Dict, Any, Optional
-from google import genai
+import openai
 from dotenv import load_dotenv
 import chromadb
 from chromadb.config import Settings
@@ -24,8 +24,8 @@ logger = logging.getLogger("vector_service")
 # ChromaDB storage path
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 
-# Gemini embedding model
-GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
+# OpenAI embedding model
+OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 
 # Simple LRU cache for embeddings (text_hash -> embedding vector)
 _embedding_cache: Dict[str, List[float]] = {}
@@ -36,9 +36,12 @@ class VectorService:
     """Service for vector-based semantic search using ChromaDB."""
 
     def __init__(self):
-        # Initialize Gemini client for embeddings
-        self.gemini_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-        self.embedding_model = GEMINI_EMBEDDING_MODEL
+        # Initialize OpenAI client for embeddings
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            logger.error("OPENAI_API_KEY not set!")
+        self.openai_client = openai.OpenAI(api_key=openai_key)
+        self.embedding_model = OPENAI_EMBEDDING_MODEL
 
         # Initialize ChromaDB with persistent storage
         self.chroma_client = chromadb.PersistentClient(
@@ -53,10 +56,10 @@ class VectorService:
             metadata={"hnsw:space": "cosine"}
         )
 
-        logger.info(f"VectorService initialized with Gemini embeddings and ChromaDB at {CHROMA_DB_PATH}")
+        logger.info(f"VectorService initialized with OpenAI embeddings and ChromaDB at {CHROMA_DB_PATH}")
 
     def _generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text using Gemini with caching."""
+        """Generate embedding for text using OpenAI with caching."""
         import hashlib
         global _embedding_cache
 
@@ -69,11 +72,11 @@ class VectorService:
             return _embedding_cache[cache_key]
 
         try:
-            response = self.gemini_client.models.embed_content(
+            response = self.openai_client.embeddings.create(
                 model=self.embedding_model,
-                contents=text[:8000]
+                input=text[:8000]
             )
-            embedding = response.embeddings[0].values
+            embedding = response.data[0].embedding
 
             # Store in cache (with size limit)
             if len(_embedding_cache) < _MAX_CACHE_SIZE:
@@ -83,6 +86,21 @@ class VectorService:
         except Exception as e:
             logger.error(f"Failed to generate embedding: {e}")
             raise
+
+    def _flatten_json_for_search(self, data: Any, prefix: str = "") -> List[str]:
+        """Recursively flatten JSON so nested fields (e.g. address/location) are searchable."""
+        parts: List[str] = []
+        if isinstance(data, dict):
+            for key, value in data.items():
+                new_prefix = f"{prefix}.{key}" if prefix else key
+                parts.extend(self._flatten_json_for_search(value, new_prefix))
+        elif isinstance(data, list):
+            for idx, value in enumerate(data):
+                new_prefix = f"{prefix}[{idx}]"
+                parts.extend(self._flatten_json_for_search(value, new_prefix))
+        elif data is not None:
+            parts.append(f"{prefix}: {data}")
+        return parts
 
     def _document_to_text(self, doc: Dict[str, Any]) -> str:
         """Convert document data to searchable text."""
@@ -104,19 +122,17 @@ class VectorService:
         if doc.get('total_amount'):
             parts.append(f"Amount: {doc['total_amount']}")
 
-        # Add extracted JSON content if available
+        # Add extracted JSON content if available (including nested fields)
         if doc.get('extracted_json'):
             try:
                 data = json.loads(doc['extracted_json'])
-                # Flatten JSON to text
-                for key, value in data.items():
-                    if isinstance(value, (str, int, float)) and key not in ['tables', 'confidence']:
-                        parts.append(f"{key}: {value}")
-                    elif isinstance(value, list) and key == 'line_items':
-                        for item in value:
-                            if isinstance(item, dict):
-                                item_text = " | ".join([f"{k}: {v}" for k, v in item.items()])
-                                parts.append(f"Item: {item_text}")
+                flattened = self._flatten_json_for_search(data)
+                # Skip noisy OCR confidence/table blobs but keep business fields like address/location/items.
+                flattened = [
+                    line for line in flattened
+                    if not line.startswith("confidence") and not line.startswith("tables")
+                ]
+                parts.extend(flattened)
             except json.JSONDecodeError:
                 pass
 
@@ -218,12 +234,27 @@ class VectorService:
             query_embedding = self._generate_embedding(query)
 
             # Search with user_id filter in metadata
-            results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=n_results,
-                where={"user_id": user_id},  # 🔐 GUARDRAIL: Only user's own documents
-                include=["metadatas", "documents", "distances"]
-            )
+            try:
+                results = self.collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=n_results,
+                    where={"user_id": user_id},  # 🔐 GUARDRAIL: Only user's own documents
+                    include=["metadatas", "documents", "distances"]
+                )
+            except Exception as e:
+                # If dimension mismatch, recreate collection and return empty results
+                if "dimension" in str(e).lower():
+                    logger.warning(f"Embedding dimension mismatch in search, recreating collection: {e}")
+                    collection_name = self.collection.name
+                    self.chroma_client.delete_collection(name=collection_name)
+                    self.collection = self.chroma_client.create_collection(
+                        name=collection_name,
+                        metadata={"hnsw:space": "cosine"}
+                    )
+                    logger.info("Collection recreated with new embedding dimensions")
+                    return []
+                else:
+                    raise
 
             # Format results
             matches = []

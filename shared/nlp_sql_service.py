@@ -6,8 +6,7 @@ import logging
 import sqlite3
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+import openai
 import anthropic
 
 load_dotenv()
@@ -18,9 +17,8 @@ logger = logging.getLogger("nlp_sql")
 from shared.vector_service import get_vector_service
 
 # Model configuration
-GEMINI_MODEL = "gemini-2.5-flash"
+GPT4O_MODEL = "gpt-4o"
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
-GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 
 # Database schema for context
 DB_SCHEMA = """
@@ -66,11 +64,14 @@ class NLPSQLService:
     """Service to convert natural language to SQL queries."""
 
     def __init__(self):
-        # Initialize Gemini client (primary)
-        self.gemini_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+        # Initialize OpenAI client (GPT-4o primary)
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            logger.error("OPENAI_API_KEY not set!")
+        self.openai_client = openai.OpenAI(api_key=openai_key)
         # Initialize Claude client (fallback)
         self.claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        # Vector service (uses Gemini embeddings)
+        # Vector service
         self.vector_service = get_vector_service()
 
     def _understand_intent(self, user_query: str) -> Dict[str, Any]:
@@ -124,26 +125,17 @@ Respond ONLY with valid JSON in this exact format:
     "suggested_action": "generate_sql|vector_fallback|chat_response|greet|explain_bot"
 }"""
 
-        # Try Gemini first
+        # Try GPT-4o first
         try:
             prompt = f"{system_prompt}\n\nClassify this query: {user_query}"
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=prompt)]
-                )
-            ]
-            
-            response = self.gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=1024,
-                )
+            response = self.openai_client.chat.completions.create(
+                model=GPT4O_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=1024
             )
             
-            text = response.text if hasattr(response, 'text') else str(response)
+            text = response.choices[0].message.content
             # Clean up JSON if needed
             if text.startswith("```json"):
                 text = text[7:]
@@ -155,7 +147,7 @@ Respond ONLY with valid JSON in this exact format:
             
             return json.loads(text)
         except Exception as e:
-            logger.warning(f"Gemini intent classification failed: {e}, trying Claude")
+            logger.warning(f"GPT-4o intent classification failed: {e}, trying Claude")
         
         # Fallback to Claude
         try:
@@ -332,26 +324,17 @@ Every query MUST be UI-compatible and follow the exact column structure.
 """
 
 
-        # Try Gemini first
+        # Try GPT-4o first
         try:
             prompt = f"{system_prompt}\n\nConvert this query to SQL: {user_query}"
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=prompt)]
-                )
-            ]
-            
-            response = self.gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=2048,
-                )
+            response = self.openai_client.chat.completions.create(
+                model=GPT4O_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=2048
             )
             
-            text = response.text if hasattr(response, 'text') else str(response)
+            text = response.choices[0].message.content
             # Clean up JSON if needed
             if text.startswith("```json"):
                 text = text[7:]
@@ -378,7 +361,7 @@ Every query MUST be UI-compatible and follow the exact column structure.
             
             return result
         except Exception as e:
-            logger.warning(f"Gemini SQL generation failed: {e}, trying Claude")
+            logger.warning(f"GPT-4o SQL generation failed: {e}, trying Claude")
         
         # Fallback to Claude
         try:
@@ -580,28 +563,19 @@ Query results ({row_count} rows):
 
 Provide a natural language summary of these results that directly answers the user's question."""
 
-            # Try Gemini first
+            # Try GPT-4o first
             try:
                 prompt = f"{system_prompt}\n\n{user_prompt}"
-                contents = [
-                    types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=prompt)]
-                    )
-                ]
-                
-                response = self.gemini_client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        temperature=0.7,
-                        max_output_tokens=1024,
-                    )
+                response = self.openai_client.chat.completions.create(
+                    model=GPT4O_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=1024
                 )
                 
-                return response.text if hasattr(response, 'text') else str(response)
+                return response.choices[0].message.content
             except Exception as e:
-                logger.warning(f"Gemini response formatting failed: {e}, trying Claude")
+                logger.warning(f"GPT-4o response formatting failed: {e}, trying Claude")
             
             # Fallback to Claude
             try:
@@ -700,12 +674,12 @@ Provide a natural language summary of these results that directly answers the us
             raise
 
     def _generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding using Gemini."""
-        response = self.gemini_client.models.embed_content(
-            model=GEMINI_EMBEDDING_MODEL,
-            contents=text[:8000]
+        """Generate embedding using OpenAI."""
+        response = self.openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text[:8000]
         )
-        return response.embeddings[0].values
+        return response.data[0].embedding
 
     def _vector_search_fallback(
         self,

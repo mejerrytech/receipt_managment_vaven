@@ -2,11 +2,12 @@ import os
 import json
 import logging
 import secrets
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, ForeignKey, BigInteger, Float
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, ForeignKey, BigInteger, Float, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.sql import func
 
@@ -68,6 +69,10 @@ class Document(Base):
     file_name = Column(String(500), nullable=True)
     mime_type = Column(String(100), nullable=True)
     file_size = Column(Integer, nullable=True)
+    telegram_file_unique_id = Column(String(255), nullable=True, index=True)
+    content_sha256 = Column(String(64), nullable=True, index=True)
+    dhash = Column(String(64), nullable=True, index=True)
+    phash = Column(String(64), nullable=True, index=True)
     
     # OCR extracted data (stored as JSON string)
     extracted_data = Column(Text, nullable=True)
@@ -135,6 +140,10 @@ class PendingDocument(Base):
     file_name = Column(String(500), nullable=True)
     mime_type = Column(String(100), nullable=True)
     file_size = Column(Integer, nullable=True)
+    telegram_file_unique_id = Column(String(255), nullable=True, index=True)
+    content_sha256 = Column(String(64), nullable=True, index=True)
+    dhash = Column(String(64), nullable=True, index=True)
+    phash = Column(String(64), nullable=True, index=True)
     
     # OCR extracted data (stored as JSON string)
     extracted_data = Column(Text, nullable=True)
@@ -145,8 +154,16 @@ class PendingDocument(Base):
     # Telegram-specific fields (for callback handling)
     telegram_chat_id = Column(BigInteger, nullable=True)
     telegram_message_id = Column(Integer, nullable=True)
+    telegram_file_id = Column(String(255), nullable=True)
     
-    # Status: 'pending', 'confirmed', 'cancelled'
+    # OCR queue metadata
+    ocr_job_id = Column(String(100), nullable=True, index=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text, nullable=True)
+    ocr_started_at = Column(DateTime(timezone=True), nullable=True)
+    ocr_completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Status: 'processing', 'ready', 'confirmed', 'cancelled', 'failed'
     status = Column(String(20), nullable=False, default='pending')
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -171,6 +188,12 @@ class PendingDocument(Base):
             "confidence_overall": self.confidence_overall,
             "telegram_chat_id": self.telegram_chat_id,
             "telegram_message_id": self.telegram_message_id,
+            "telegram_file_id": self.telegram_file_id,
+            "ocr_job_id": self.ocr_job_id,
+            "retry_count": self.retry_count,
+            "error_message": self.error_message,
+            "ocr_started_at": self.ocr_started_at.isoformat() if self.ocr_started_at else None,
+            "ocr_completed_at": self.ocr_completed_at.isoformat() if self.ocr_completed_at else None,
             "status": self.status,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
@@ -180,7 +203,44 @@ class PendingDocument(Base):
 def init_db():
     """Initialize database - create all tables."""
     Base.metadata.create_all(bind=engine)
+    _ensure_hash_columns()
+    _ensure_pending_queue_columns()
     logger.info("Database initialized successfully")
+
+
+def _ensure_hash_columns():
+    """Lightweight migration to add hash columns on existing SQLite tables."""
+    with engine.connect() as conn:
+        for table in ("documents", "pending_documents"):
+            cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+            if "telegram_file_unique_id" not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN telegram_file_unique_id VARCHAR(255)"))
+            if "content_sha256" not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN content_sha256 VARCHAR(64)"))
+            if "dhash" not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN dhash VARCHAR(64)"))
+            if "phash" not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN phash VARCHAR(64)"))
+        conn.commit()
+
+
+def _ensure_pending_queue_columns():
+    """Add queue-tracking columns on pending_documents for existing DBs."""
+    with engine.connect() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(pending_documents)"))}
+        if "telegram_file_id" not in cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN telegram_file_id VARCHAR(255)"))
+        if "ocr_job_id" not in cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN ocr_job_id VARCHAR(100)"))
+        if "retry_count" not in cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN retry_count INTEGER DEFAULT 0"))
+        if "error_message" not in cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN error_message TEXT"))
+        if "ocr_started_at" not in cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN ocr_started_at DATETIME"))
+        if "ocr_completed_at" not in cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN ocr_completed_at DATETIME"))
+        conn.commit()
 
 
 def get_db():
@@ -238,8 +298,12 @@ class DatabaseService:
 
     @staticmethod
     def save_document(user_id: int, file_name: Optional[str], mime_type: Optional[str],
-                      file_size: Optional[int], extracted_json: str, 
-                      raw_text: Optional[str] = None) -> Document:
+                      file_size: Optional[int], extracted_json: str,
+                      raw_text: Optional[str] = None,
+                      telegram_file_unique_id: Optional[str] = None,
+                      content_sha256: Optional[str] = None,
+                      dhash: Optional[str] = None,
+                      phash: Optional[str] = None) -> Document:
         """Save document with OCR extraction results."""
         db = get_db()
         try:
@@ -260,6 +324,10 @@ class DatabaseService:
                 file_name=file_name,
                 mime_type=mime_type,
                 file_size=file_size,
+                telegram_file_unique_id=telegram_file_unique_id,
+                content_sha256=content_sha256,
+                dhash=dhash,
+                phash=phash,
                 extracted_data=extracted_json,
                 document_type=data.get("document_type"),
                 title=data.get("title"),
@@ -388,7 +456,14 @@ class DatabaseService:
                                 confidence_overall: Optional[float] = None,
                                 source: str = 'web',
                                 telegram_chat_id: Optional[int] = None,
-                                telegram_message_id: Optional[int] = None) -> PendingDocument:
+                                telegram_message_id: Optional[int] = None,
+                                telegram_file_id: Optional[str] = None,
+                                telegram_file_unique_id: Optional[str] = None,
+                                content_sha256: Optional[str] = None,
+                                dhash: Optional[str] = None,
+                                phash: Optional[str] = None,
+                                status: str = 'pending',
+                                ocr_job_id: Optional[str] = None) -> PendingDocument:
         """Create a pending document awaiting user confirmation."""
         db = get_db()
         try:
@@ -405,11 +480,18 @@ class DatabaseService:
                 file_name=file_name,
                 mime_type=mime_type,
                 file_size=file_size,
+                telegram_file_unique_id=telegram_file_unique_id,
+                content_sha256=content_sha256,
+                dhash=dhash,
+                phash=phash,
                 extracted_data=extracted_json,
                 confidence_overall=confidence_overall,
                 telegram_chat_id=telegram_chat_id,
                 telegram_message_id=telegram_message_id,
-                status='pending',
+                telegram_file_id=telegram_file_id,
+                status=status,
+                ocr_job_id=ocr_job_id,
+                ocr_started_at=datetime.utcnow() if status == 'processing' else None,
                 expires_at=expires_at
             )
             
@@ -432,7 +514,7 @@ class DatabaseService:
         try:
             return db.query(PendingDocument).filter(
                 PendingDocument.token == token,
-                PendingDocument.status == 'pending'
+                PendingDocument.status.in_(['pending', 'ready'])
             ).first()
         finally:
             db.close()
@@ -445,8 +527,17 @@ class DatabaseService:
             return db.query(PendingDocument).filter(
                 PendingDocument.id == pending_id,
                 PendingDocument.user_id == user_id,
-                PendingDocument.status == 'pending'
+                PendingDocument.status.in_(['pending', 'ready'])
             ).first()
+        finally:
+            db.close()
+
+    @staticmethod
+    def get_pending_document_for_job(pending_id: int) -> Optional[PendingDocument]:
+        """Get pending document for background processing regardless of user/session."""
+        db = get_db()
+        try:
+            return db.query(PendingDocument).filter(PendingDocument.id == pending_id).first()
         finally:
             db.close()
 
@@ -457,7 +548,7 @@ class DatabaseService:
         try:
             pendings = db.query(PendingDocument).filter(
                 PendingDocument.user_id == user_id,
-                PendingDocument.status == 'pending'
+                PendingDocument.status.in_(['pending', 'processing', 'ready'])
             ).order_by(PendingDocument.created_at.desc()).limit(limit).all()
             return pendings
         finally:
@@ -471,7 +562,7 @@ class DatabaseService:
             # Get pending document
             pending = db.query(PendingDocument).filter(
                 PendingDocument.id == pending_id,
-                PendingDocument.status == 'pending'
+                PendingDocument.status.in_(['pending', 'ready'])
             ).first()
             
             if not pending:
@@ -484,7 +575,11 @@ class DatabaseService:
                 file_name=pending.file_name,
                 mime_type=pending.mime_type,
                 file_size=pending.file_size,
-                extracted_json=pending.extracted_data
+                extracted_json=pending.extracted_data,
+                telegram_file_unique_id=pending.telegram_file_unique_id,
+                content_sha256=pending.content_sha256,
+                dhash=pending.dhash,
+                phash=pending.phash
             )
             
             # Mark pending as confirmed
@@ -507,7 +602,7 @@ class DatabaseService:
         try:
             pending = db.query(PendingDocument).filter(
                 PendingDocument.id == pending_id,
-                PendingDocument.status == 'pending'
+                PendingDocument.status.in_(['pending', 'ready'])
             ).first()
             
             if not pending:
@@ -528,13 +623,343 @@ class DatabaseService:
             db.close()
 
     @staticmethod
+    def count_user_inflight_pending_documents(user_id: int) -> int:
+        """Count pending OCR jobs currently in processing state for a user."""
+        db = get_db()
+        try:
+            return db.query(PendingDocument).filter(
+                PendingDocument.user_id == user_id,
+                PendingDocument.status == 'processing'
+            ).count()
+        finally:
+            db.close()
+
+    @staticmethod
+    def set_pending_job_id(pending_id: int, job_id: str) -> Optional[PendingDocument]:
+        """Attach Celery job id to pending document."""
+        db = get_db()
+        try:
+            pending = db.query(PendingDocument).filter(PendingDocument.id == pending_id).first()
+            if not pending:
+                return None
+            pending.ocr_job_id = job_id
+            db.commit()
+            db.refresh(pending)
+            return pending
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Database error in set_pending_job_id: {e}")
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def set_pending_telegram_message_id(pending_id: int, message_id: int) -> Optional[PendingDocument]:
+        """Persist Telegram message id linked to the pending workflow."""
+        db = get_db()
+        try:
+            pending = db.query(PendingDocument).filter(PendingDocument.id == pending_id).first()
+            if not pending:
+                return None
+            pending.telegram_message_id = message_id
+            db.commit()
+            db.refresh(pending)
+            return pending
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Database error in set_pending_telegram_message_id: {e}")
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def mark_pending_ocr_ready(pending_id: int, extracted_json: str, confidence_overall: Optional[float]) -> Optional[PendingDocument]:
+        """Mark pending OCR job complete and ready for user confirmation."""
+        db = get_db()
+        try:
+            pending = db.query(PendingDocument).filter(PendingDocument.id == pending_id).first()
+            if not pending or pending.status in ('confirmed', 'cancelled'):
+                return None
+            pending.extracted_data = extracted_json
+            pending.confidence_overall = confidence_overall
+            pending.status = 'ready'
+            pending.error_message = None
+            pending.ocr_completed_at = datetime.utcnow()
+            db.commit()
+            db.refresh(pending)
+            return pending
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Database error in mark_pending_ocr_ready: {e}")
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def mark_pending_ocr_failed(pending_id: int, error_message: str, retry_count: int = 0) -> Optional[PendingDocument]:
+        """Mark pending OCR job failed after retries."""
+        db = get_db()
+        try:
+            pending = db.query(PendingDocument).filter(PendingDocument.id == pending_id).first()
+            if not pending or pending.status in ('confirmed', 'cancelled'):
+                return None
+            pending.status = 'failed'
+            pending.retry_count = retry_count
+            pending.error_message = error_message[:1000] if error_message else "OCR job failed"
+            pending.ocr_completed_at = datetime.utcnow()
+            db.commit()
+            db.refresh(pending)
+            return pending
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Database error in mark_pending_ocr_failed: {e}")
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _hamming_distance(hex_a: str, hex_b: str) -> int:
+        """Compute Hamming distance between two equal-length hex hashes."""
+        try:
+            a = int(hex_a, 16)
+            b = int(hex_b, 16)
+            return (a ^ b).bit_count()
+        except Exception:
+            return 999
+
+    @staticmethod
+    def _normalize_text(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        return re.sub(r"\s+", " ", str(value).strip().lower())
+
+    @staticmethod
+    def _build_fingerprint_from_extracted_json(extracted_json: Optional[str]) -> dict:
+        """Extract comparable fields from OCR JSON for duplicate matching."""
+        if not extracted_json:
+            return {}
+        try:
+            data = json.loads(extracted_json) if isinstance(extracted_json, str) else extracted_json
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+
+        amounts = data.get("amounts") or {}
+        vendor = data.get("vendor_or_sender") or {}
+        identifiers = data.get("identifiers") or {}
+
+        total_amount = amounts.get("total")
+        try:
+            total_amount = float(total_amount) if total_amount is not None else None
+        except Exception:
+            total_amount = None
+
+        return {
+            "vendor_name": DatabaseService._normalize_text(vendor.get("name")),
+            "invoice_number": DatabaseService._normalize_text(identifiers.get("invoice_number")),
+            "date": DatabaseService._normalize_text(data.get("date")),
+            "title": DatabaseService._normalize_text(data.get("title")),
+            "total_amount": total_amount
+        }
+
+    @staticmethod
+    def find_duplicate_image_for_user(user_id: int,
+                                      telegram_file_unique_id: Optional[str] = None,
+                                      content_sha256: Optional[str] = None,
+                                      dhash: Optional[str] = None,
+                                      phash: Optional[str] = None,
+                                      max_dhash_distance: int = 8,
+                                      max_phash_distance: int = 8) -> Optional[dict]:
+        """Find likely duplicate image for the same user using dHash + pHash."""
+        if not telegram_file_unique_id and not content_sha256 and (not dhash or not phash):
+            return None
+        db = get_db()
+        try:
+            # Telegram-native stable file identity check (best for repeated uploads).
+            if telegram_file_unique_id:
+                existing = db.query(Document).filter(
+                    Document.user_id == user_id,
+                    Document.telegram_file_unique_id == telegram_file_unique_id
+                ).first()
+                if existing:
+                    return {
+                        "source": "documents",
+                        "id": existing.id,
+                        "file_name": existing.file_name,
+                        "created_at": existing.created_at.isoformat() if existing.created_at else None,
+                        "match_type": "telegram_file_unique_id"
+                    }
+                existing_pending = db.query(PendingDocument).filter(
+                    PendingDocument.user_id == user_id,
+                    PendingDocument.status.in_(['pending', 'processing', 'ready']),
+                    PendingDocument.telegram_file_unique_id == telegram_file_unique_id
+                ).first()
+                if existing_pending:
+                    return {
+                        "source": "pending_documents",
+                        "id": existing_pending.id,
+                        "file_name": existing_pending.file_name,
+                        "created_at": existing_pending.created_at.isoformat() if existing_pending.created_at else None,
+                        "match_type": "telegram_file_unique_id"
+                    }
+
+            # Exact byte-level duplicate check via SHA-256 (works even without PIL/ImageHash)
+            if content_sha256:
+                existing = db.query(Document).filter(
+                    Document.user_id == user_id,
+                    Document.content_sha256 == content_sha256
+                ).first()
+                if existing:
+                    return {
+                        "source": "documents",
+                        "id": existing.id,
+                        "file_name": existing.file_name,
+                        "created_at": existing.created_at.isoformat() if existing.created_at else None,
+                        "match_type": "sha256_exact"
+                    }
+
+                existing_pending = db.query(PendingDocument).filter(
+                    PendingDocument.user_id == user_id,
+                    PendingDocument.status.in_(['pending', 'processing', 'ready']),
+                    PendingDocument.content_sha256 == content_sha256
+                ).first()
+                if existing_pending:
+                    return {
+                        "source": "pending_documents",
+                        "id": existing_pending.id,
+                        "file_name": existing_pending.file_name,
+                        "created_at": existing_pending.created_at.isoformat() if existing_pending.created_at else None,
+                        "match_type": "sha256_exact"
+                    }
+
+            # Perceptual duplicate check (if hashes available)
+            if not dhash or not phash:
+                return None
+
+            # Check confirmed documents first
+            docs = db.query(Document).filter(
+                Document.user_id == user_id,
+                Document.dhash.isnot(None),
+                Document.phash.isnot(None)
+            ).all()
+            for d in docs:
+                dd = DatabaseService._hamming_distance(dhash, d.dhash)
+                pd = DatabaseService._hamming_distance(phash, d.phash)
+                if dd <= max_dhash_distance and pd <= max_phash_distance:
+                    return {
+                        "source": "documents",
+                        "id": d.id,
+                        "file_name": d.file_name,
+                        "created_at": d.created_at.isoformat() if d.created_at else None,
+                        "dhash_distance": dd,
+                        "phash_distance": pd
+                    }
+
+            # Check pending documents
+            pending_docs = db.query(PendingDocument).filter(
+                PendingDocument.user_id == user_id,
+                PendingDocument.status.in_(['pending', 'processing', 'ready']),
+                PendingDocument.dhash.isnot(None),
+                PendingDocument.phash.isnot(None)
+            ).all()
+            for p in pending_docs:
+                dd = DatabaseService._hamming_distance(dhash, p.dhash)
+                pd = DatabaseService._hamming_distance(phash, p.phash)
+                if dd <= max_dhash_distance and pd <= max_phash_distance:
+                    return {
+                        "source": "pending_documents",
+                        "id": p.id,
+                        "file_name": p.file_name,
+                        "created_at": p.created_at.isoformat() if p.created_at else None,
+                        "dhash_distance": dd,
+                        "phash_distance": pd
+                    }
+            return None
+        finally:
+            db.close()
+
+    @staticmethod
+    def find_duplicate_by_extracted_fingerprint(user_id: int, extracted_json: str) -> Optional[dict]:
+        """
+        Fallback duplicate detection using OCR-extracted business fields.
+        Useful when Telegram file identifiers/bytes differ across uploads.
+        """
+        fp = DatabaseService._build_fingerprint_from_extracted_json(extracted_json)
+        if not fp:
+            return None
+
+        vendor = fp.get("vendor_name")
+        invoice_number = fp.get("invoice_number")
+        date = fp.get("date")
+        title = fp.get("title")
+        total_amount = fp.get("total_amount")
+
+        db = get_db()
+        try:
+            docs = db.query(Document).filter(
+                Document.user_id == user_id,
+                Document.extracted_data.isnot(None)
+            ).order_by(Document.created_at.desc()).limit(200).all()
+
+            for d in docs:
+                existing = DatabaseService._build_fingerprint_from_extracted_json(d.extracted_data)
+                if not existing:
+                    continue
+                e_vendor = existing.get("vendor_name")
+                e_invoice = existing.get("invoice_number")
+                e_date = existing.get("date")
+                e_title = existing.get("title")
+                e_total = existing.get("total_amount")
+
+                amount_match = (
+                    total_amount is not None and e_total is not None and abs(total_amount - e_total) < 0.01
+                )
+                # Strong signals
+                if invoice_number and e_invoice and invoice_number == e_invoice and (amount_match or (vendor and e_vendor and vendor == e_vendor)):
+                    return {"source": "documents", "id": d.id, "file_name": d.file_name, "match_type": "ocr_fingerprint_invoice"}
+                if vendor and e_vendor and vendor == e_vendor and amount_match and date and e_date and date == e_date:
+                    return {"source": "documents", "id": d.id, "file_name": d.file_name, "match_type": "ocr_fingerprint_vendor_amount_date"}
+                if title and e_title and title == e_title and amount_match and date and e_date and date == e_date:
+                    return {"source": "documents", "id": d.id, "file_name": d.file_name, "match_type": "ocr_fingerprint_title_amount_date"}
+
+            pending_docs = db.query(PendingDocument).filter(
+                PendingDocument.user_id == user_id,
+                PendingDocument.status.in_(['pending', 'processing', 'ready']),
+                PendingDocument.extracted_data.isnot(None)
+            ).order_by(PendingDocument.created_at.desc()).limit(200).all()
+
+            for p in pending_docs:
+                existing = DatabaseService._build_fingerprint_from_extracted_json(p.extracted_data)
+                if not existing:
+                    continue
+                e_vendor = existing.get("vendor_name")
+                e_invoice = existing.get("invoice_number")
+                e_date = existing.get("date")
+                e_title = existing.get("title")
+                e_total = existing.get("total_amount")
+                amount_match = (
+                    total_amount is not None and e_total is not None and abs(total_amount - e_total) < 0.01
+                )
+                if invoice_number and e_invoice and invoice_number == e_invoice and (amount_match or (vendor and e_vendor and vendor == e_vendor)):
+                    return {"source": "pending_documents", "id": p.id, "file_name": p.file_name, "match_type": "ocr_fingerprint_invoice"}
+                if vendor and e_vendor and vendor == e_vendor and amount_match and date and e_date and date == e_date:
+                    return {"source": "pending_documents", "id": p.id, "file_name": p.file_name, "match_type": "ocr_fingerprint_vendor_amount_date"}
+                if title and e_title and title == e_title and amount_match and date and e_date and date == e_date:
+                    return {"source": "pending_documents", "id": p.id, "file_name": p.file_name, "match_type": "ocr_fingerprint_title_amount_date"}
+
+            return None
+        finally:
+            db.close()
+
+    @staticmethod
     def cancel_pending_document(pending_id: int) -> bool:
         """Cancel a pending document."""
         db = get_db()
         try:
             pending = db.query(PendingDocument).filter(
                 PendingDocument.id == pending_id,
-                PendingDocument.status == 'pending'
+                PendingDocument.status.in_(['pending', 'processing', 'ready', 'failed'])
             ).first()
             
             if not pending:
@@ -559,7 +984,7 @@ class DatabaseService:
         try:
             now = datetime.utcnow()
             expired = db.query(PendingDocument).filter(
-                PendingDocument.status == 'pending',
+                PendingDocument.status.in_(['pending', 'processing', 'ready', 'failed']),
                 PendingDocument.expires_at < now
             ).all()
             

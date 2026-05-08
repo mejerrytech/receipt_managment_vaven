@@ -1,11 +1,11 @@
 """
 Multi-model OCR Service with confidence-based routing.
 
-Primary (80%): Gemini 2.5 Flash
-Fallback (20%): Claude Opus 4.5
+Primary: GPT-4o (Vision)
+Fallback: Claude Opus 4.5
 
 Flow:
-1. Send image to Gemini 2.5 Flash first
+1. Send image to GPT-4o Vision first
 2. Parse JSON response, compute confidence scores
 3. If all critical fields ≥ 0.80 → accept result
 4. If any critical field < 0.60 OR JSON parse fails → retry with Claude Opus 4.5
@@ -21,9 +21,8 @@ from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
-# Import Google GenAI for Gemini
-from google import genai
-from google.genai import types
+# Import OpenAI for GPT-4o
+import openai
 
 # Import Anthropic for Claude
 import anthropic
@@ -33,7 +32,7 @@ load_dotenv()
 logger = logging.getLogger("ocr_service")
 
 # Model configuration
-GEMINI_MODEL = "gemini-2.5-flash"
+GPT4O_MODEL = "gpt-4o"
 CLAUDE_MODEL = "claude-opus-4-5-20251101"  # Claude Opus 4.5
 
 # Confidence thresholds
@@ -56,8 +55,11 @@ class OCRService:
     """Multi-model OCR service with confidence-based routing."""
     
     def __init__(self):
-        # Initialize Gemini client
-        self.gemini_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+        # Initialize OpenAI client (GPT-4o)
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            logger.error("OPENAI_API_KEY not set!")
+        self.openai_client = openai.OpenAI(api_key=openai_key)
         
         # Initialize Claude client
         self.claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -154,44 +156,45 @@ Adapt the fields based on the document type. For non-financial documents, includ
         else:
             return "pending_review", min_critical
     
-    async def _extract_with_gemini(
-        self, 
-        image_bytes: bytes, 
+    async def _extract_with_gpt4o(
+        self,
+        image_bytes: bytes,
         mime_type: str,
         custom_prompt: Optional[str] = None
     ) -> Optional[OCRResult]:
-        """Extract data using Gemini 2.5 Flash."""
+        """Extract data using GPT-4o Vision."""
         try:
             user_prompt = custom_prompt or self.extraction_prompt
-            
-            # Create content parts
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(text=user_prompt),
-                        types.Part.from_bytes(
-                            data=image_bytes,
-                            mime_type=mime_type
-                        )
-                    ]
-                )
-            ]
-            
-            # Generate response
+            base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
             response = await asyncio.to_thread(
-                self.gemini_client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=4096,
-                )
+                self.openai_client.chat.completions.create,
+                model=GPT4O_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": self.system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{base64_image}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=4096
             )
-            
+
             # Parse JSON response
-            text = response.text if hasattr(response, 'text') else str(response)
-            
+            text = response.choices[0].message.content
+
             # Clean up JSON (remove markdown code blocks if present)
             if text.startswith("```json"):
                 text = text[7:]
@@ -200,26 +203,26 @@ Adapt the fields based on the document type. For non-financial documents, includ
             if text.endswith("```"):
                 text = text[:-3]
             text = text.strip()
-            
+
             data = json.loads(text)
-            
+
             # Parse confidence scores
             confidence = self._parse_confidence_scores(data)
-            
+
             # Assess quality
             status, min_critical = self._assess_quality(confidence)
-            
+
             return OCRResult(
                 data=data,
                 confidence=confidence,
                 overall_confidence=confidence["overall"],
-                model_used="gemini-2.5-flash",
+                model_used="gpt-4o",
                 status=status,
                 fallback_used=False
             )
-            
+
         except Exception as e:
-            logger.error(f"Gemini OCR failed: {e}")
+            logger.error(f"GPT-4o OCR failed: {e}")
             return None
     
     async def _extract_with_claude(
@@ -300,20 +303,20 @@ Adapt the fields based on the document type. For non-financial documents, includ
         Extract data from image with confidence-based model routing.
         
         Flow:
-        1. Try Gemini 2.5 Flash first
+        1. Try GPT-4o Vision first
         2. If confidence < 0.60 or JSON parse fails → try Claude Opus 4.5
         3. Return the better result
         
         Returns:
             JSON string with extracted data and metadata
         """
-        logger.info("Starting OCR extraction with Gemini 2.5 Flash (primary)")
-        
-        # Step 1: Try Gemini first
-        gemini_result = await self._extract_with_gemini(image_bytes, mime_type, custom_prompt)
-        
-        if gemini_result is None:
-            logger.warning("Gemini OCR failed, falling back to Claude Opus 4.5")
+        logger.info("Starting OCR extraction with GPT-4o Vision (primary)")
+
+        # Step 1: Try GPT-4o first
+        gpt4o_result = await self._extract_with_gpt4o(image_bytes, mime_type, custom_prompt)
+
+        if gpt4o_result is None:
+            logger.warning("GPT-4o OCR failed, falling back to Claude Opus 4.5")
             claude_result = await self._extract_with_claude(image_bytes, mime_type, custom_prompt)
             
             if claude_result is None:
@@ -332,17 +335,17 @@ Adapt the fields based on the document type. For non-financial documents, includ
                     "fallback_used": True
                 }
             })
-        
+
         # Step 2: Check if we need fallback
         min_critical = min([
-            gemini_result.confidence.get("amounts_total", 0.0),
-            gemini_result.confidence.get("vendor_name", 0.0),
-            gemini_result.confidence.get("document_type", 0.0),
-            gemini_result.confidence.get("invoice_number", 0.0)
-        ]) if gemini_result.confidence else 0.0
-        
+            gpt4o_result.confidence.get("amounts_total", 0.0),
+            gpt4o_result.confidence.get("vendor_name", 0.0),
+            gpt4o_result.confidence.get("document_type", 0.0),
+            gpt4o_result.confidence.get("invoice_number", 0.0)
+        ]) if gpt4o_result.confidence else 0.0
+
         if min_critical < FALLBACK_THRESHOLD:
-            logger.warning(f"Gemini confidence too low ({min_critical:.2f}), trying Claude Opus 4.5")
+            logger.warning(f"GPT-4o confidence too low ({min_critical:.2f}), trying Claude Opus 4.5")
             
             claude_result = await self._extract_with_claude(image_bytes, mime_type, custom_prompt)
             
@@ -355,8 +358,8 @@ Adapt the fields based on the document type. For non-financial documents, includ
                     claude_result.confidence.get("invoice_number", 0.0)
                 ])
                 
-                logger.info(f"Gemini min critical: {min_critical:.2f}, Claude min critical: {claude_min_critical:.2f}")
-                
+                logger.info(f"GPT-4o min critical: {min_critical:.2f}, Claude min critical: {claude_min_critical:.2f}")
+
                 # Use the result with higher critical field confidence
                 if claude_min_critical > min_critical:
                     logger.info("Claude result is better, using Claude")
@@ -372,17 +375,17 @@ Adapt the fields based on the document type. For non-financial documents, includ
                         }
                     })
                 else:
-                    logger.info("Gemini result is better or equal, keeping Gemini")
-        
-        # Return Gemini result (either good enough or better than Claude)
+                    logger.info("GPT-4o result is better or equal, keeping GPT-4o")
+
+        # Return GPT-4o result (either good enough or better than Claude)
         return json.dumps({
-            **gemini_result.data,
+            **gpt4o_result.data,
             "_ocr_metadata": {
-                "model_used": gemini_result.model_used,
-                "overall_confidence": gemini_result.overall_confidence,
-                "field_confidences": gemini_result.confidence,
-                "status": gemini_result.status,
-                "fallback_used": gemini_result.fallback_used
+                "model_used": gpt4o_result.model_used,
+                "overall_confidence": gpt4o_result.overall_confidence,
+                "field_confidences": gpt4o_result.confidence,
+                "status": gpt4o_result.status,
+                "fallback_used": gpt4o_result.fallback_used
             }
         })
 

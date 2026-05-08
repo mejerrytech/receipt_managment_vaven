@@ -28,6 +28,44 @@ nano .env  # Add TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, and ANTHROPIC_API_KEY
 python run_bot.py
 ```
 
+## Async OCR Queue (Redis + Celery)
+
+This project now supports asynchronous OCR processing for upload spikes.
+
+### 1) Start local Redis service
+
+```bash
+sudo systemctl start redis
+sudo systemctl status redis
+```
+
+### 2) Start Telegram bot (producer)
+
+```bash
+source env/bin/activate
+python run_bot.py
+```
+
+### 3) Start Celery worker (consumer)
+
+```bash
+source env/bin/activate
+celery -A shared.celery_app:celery_app worker -Q ocr_jobs --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
+```
+
+### 4) Recommended `.env` queue settings
+
+```bash
+CELERY_BROKER_URL=redis://localhost:6379/0
+CELERY_RESULT_BACKEND=redis://localhost:6379/1
+CELERY_WORKER_CONCURRENCY=4
+CELERY_TASK_MAX_RETRIES=3
+CELERY_TASK_RETRY_BACKOFF_SECONDS=10
+OCR_TASK_SOFT_TIME_LIMIT=120
+OCR_TASK_TIME_LIMIT=180
+OCR_MAX_INFLIGHT_PER_USER=3
+```
+
 ## Production Deployment
 
 

@@ -3,8 +3,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+import openai
 import anthropic
 
 load_dotenv()
@@ -16,51 +15,41 @@ DEFAULT_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
 MAX_HISTORY = int(os.getenv("MAX_CONVERSATION_HISTORY", "10"))
 
 # Model configuration
-GEMINI_MODEL = "gemini-2.5-flash"
+GPT4O_MODEL = "gpt-4o"
+GPT4O_MINI = "gpt-4o-mini"
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 
 
 class OpenAIService:
     def __init__(self, timeout: int = DEFAULT_TIMEOUT, max_retries: int = DEFAULT_MAX_RETRIES) -> None:
-        # Initialize Gemini client (primary)
-        self.gemini_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+        # Initialize OpenAI client (GPT-4o primary)
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            logger.error("OPENAI_API_KEY not set!")
+        self.openai_client = openai.OpenAI(api_key=openai_key)
         # Initialize Claude client (fallback)
         self.claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         self.max_retries = max_retries
         self.conversations: Dict[str, List[Dict]] = {}
 
-    def _resp_with_gemini(self, prompt: str, system_prompt: str | None = None, use_search: bool = False) -> Optional[str]:
-        """Generate response using Gemini 2.5 Flash."""
+    def _resp_with_gpt4o(self, prompt: str, system_prompt: str | None = None, use_search: bool = False) -> Optional[str]:
+        """Generate response using GPT-4o (primary)."""
         try:
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=prompt)]
-                )
-            ]
-            
-            # Add system prompt if provided (Gemini doesn't have separate system field, prepend to prompt)
+            messages = []
             if system_prompt:
-                prompt = f"{system_prompt}\n\n{prompt}"
-                contents[0].parts = [types.Part.from_text(text=prompt)]
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
             
-            # Note: Gemini doesn't have built-in web_search tool like OpenAI
-            # For web search, we'd need to implement it separately or use a different approach
-            if use_search:
-                logger.warning("Web search requested but Gemini doesn't have built-in web search tool")
-            
-            response = self.gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.7,
-                    max_output_tokens=4096,
-                )
+            response = self.openai_client.chat.completions.create(
+                model=GPT4O_MODEL,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=4096
             )
             
-            return response.text if hasattr(response, 'text') else str(response)
+            return response.choices[0].message.content
         except Exception as e:
-            logger.error(f"Gemini response failed: {e}")
+            logger.error(f"GPT-4o response failed: {e}")
             return None
 
     def _resp_with_claude(self, prompt: str, system_prompt: str | None = None, use_search: bool = False) -> Optional[str]:
@@ -86,14 +75,14 @@ class OpenAIService:
             return None
 
     def _resp(self, prompt: str, system_prompt: str | None = None, use_search: bool = False) -> str:
-        """Try Gemini first, fallback to Claude if it fails."""
-        # Try Gemini first
-        result = self._resp_with_gemini(prompt, system_prompt, use_search)
+        """Try GPT-4o first, fallback to Claude if it fails."""
+        # Try GPT-4o first
+        result = self._resp_with_gpt4o(prompt, system_prompt, use_search)
         if result:
             return result
         
         # Fallback to Claude
-        logger.info("Gemini failed, falling back to Claude")
+        logger.info("GPT-4o failed, falling back to Claude")
         result = self._resp_with_claude(prompt, system_prompt, use_search)
         if result:
             return result

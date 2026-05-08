@@ -529,6 +529,108 @@ def dashboard(request: Request):
             font-weight: 700;
             color: #667eea;
         }
+        .visual-dashboard {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .visual-dashboard h2 {
+            font-size: 1.125rem;
+            margin-bottom: 1rem;
+            color: #333;
+        }
+        .visual-grid {
+            display: grid;
+            grid-template-columns: minmax(260px, 320px) 1fr;
+            gap: 1.5rem;
+            align-items: center;
+        }
+        .donut-wrap {
+            position: relative;
+            width: 250px;
+            height: 250px;
+            margin: 0 auto;
+            border-radius: 50%;
+            background: conic-gradient(#dbeafe 0 100%);
+            display: grid;
+            place-items: center;
+        }
+        .donut-inner {
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            background: white;
+            display: grid;
+            place-items: center;
+            text-align: center;
+            box-shadow: inset 0 0 0 1px #f0f0f0;
+            padding: 0.5rem;
+        }
+        .donut-inner .donut-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #3b82f6;
+            line-height: 1.1;
+        }
+        .donut-inner .donut-label {
+            font-size: 0.75rem;
+            color: #666;
+            margin-top: 0.25rem;
+        }
+        .insight-list {
+            display: grid;
+            gap: 0.65rem;
+        }
+        .insight-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #f8fafc;
+            border: 1px solid #edf2f7;
+            border-radius: 10px;
+            padding: 0.65rem 0.85rem;
+            font-size: 0.9rem;
+        }
+        .insight-item .left {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+        .category-cards {
+            margin-top: 1rem;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 0.65rem;
+        }
+        .category-card {
+            border: 1px solid #edf2f7;
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 0.75rem;
+            text-align: center;
+        }
+        .category-card .icon {
+            font-size: 1.3rem;
+            margin-bottom: 0.35rem;
+        }
+        .category-card .name {
+            font-size: 0.8rem;
+            color: #555;
+            text-transform: capitalize;
+        }
+        .category-card .value {
+            margin-top: 0.2rem;
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #2563eb;
+        }
         .tabs {
             display: flex;
             gap: 0.5rem;
@@ -768,6 +870,9 @@ def dashboard(request: Request):
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+        @media (max-width: 900px) {
+            .visual-grid { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
@@ -803,6 +908,24 @@ def dashboard(request: Request):
             <div class="stat-card">
                 <h3>Total Amount (INR)</h3>
                 <div class="stat-value" id="stat-amount">-</div>
+            </div>
+        </div>
+
+        <div class="visual-dashboard">
+            <h2>📱 Expense Snapshot</h2>
+            <div class="visual-grid">
+                <div class="donut-wrap" id="expense-donut">
+                    <div class="donut-inner">
+                        <div class="donut-value" id="donut-total">₹0</div>
+                        <div class="donut-label">Total Spend</div>
+                    </div>
+                </div>
+                <div>
+                    <div class="insight-list" id="insight-list">
+                        <div class="insight-item"><span class="left">No data yet</span><span>-</span></div>
+                    </div>
+                    <div class="category-cards" id="category-cards"></div>
+                </div>
             </div>
         </div>
 
@@ -927,6 +1050,7 @@ def dashboard(request: Request):
     <script>
         let currentUserId = null;
         let allUsers = [];
+        const dashboardPalette = ['#3b82f6', '#f97316', '#8b5cf6', '#06b6d4', '#ef4444', '#eab308'];
 
         // Load stats
         async function loadStats() {
@@ -994,10 +1118,98 @@ def dashboard(request: Request):
 
                     // Add system message to chat
                     addMessage(\'ai\', `👋 Hello ${data.user_name}! I\'m your AI assistant. Ask me anything about your documents, and I\'ll securely search only YOUR data.`);
+                    loadDocuments();
                 }
             } catch (e) {
                 console.error(\'Failed to set user:\', e);
             }
+        }
+
+        function formatINR(value) {
+            return '₹' + (value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+        }
+
+        function renderVisualDashboard(docs) {
+            const scopedDocs = currentUserId
+                ? docs.filter(d => String(d.user_id) === String(currentUserId))
+                : docs;
+
+            const totalAmount = scopedDocs.reduce((sum, d) => sum + (Number(d.total_amount) || 0), 0);
+            const donut = document.getElementById('expense-donut');
+            const donutTotal = document.getElementById('donut-total');
+            const insightList = document.getElementById('insight-list');
+            const categoryCards = document.getElementById('category-cards');
+
+            donutTotal.textContent = formatINR(totalAmount);
+
+            if (!scopedDocs.length || totalAmount <= 0) {
+                donut.style.background = 'conic-gradient(#dbeafe 0 100%)';
+                insightList.innerHTML = '<div class="insight-item"><span class="left">No spending data found</span><span>—</span></div>';
+                categoryCards.innerHTML = '';
+                return;
+            }
+
+            const byType = {};
+            scopedDocs.forEach(doc => {
+                const key = (doc.document_type || 'other').toLowerCase();
+                if (!byType[key]) byType[key] = { amount: 0, count: 0 };
+                byType[key].amount += Number(doc.total_amount) || 0;
+                byType[key].count += 1;
+            });
+
+            const entries = Object.entries(byType)
+                .map(([k, v]) => ({ key: k, ...v }))
+                .sort((a, b) => b.amount - a.amount);
+
+            let start = 0;
+            const segments = entries.map((entry, idx) => {
+                const pct = Math.max(0, (entry.amount / totalAmount) * 100);
+                const end = start + pct;
+                const segment = { ...entry, pct, color: dashboardPalette[idx % dashboardPalette.length], start, end };
+                start = end;
+                return segment;
+            });
+
+            donut.style.background = `conic-gradient(${segments
+                .map(s => `${s.color} ${s.start.toFixed(2)}% ${s.end.toFixed(2)}%`)
+                .join(', ')})`;
+
+            const topVendor = scopedDocs.reduce((acc, d) => {
+                const vendor = d.vendor_name || 'Unknown';
+                const amount = Number(d.total_amount) || 0;
+                if (!acc[vendor]) acc[vendor] = 0;
+                acc[vendor] += amount;
+                return acc;
+            }, {});
+            const [bestVendor, bestAmount] = Object.entries(topVendor).sort((a, b) => b[1] - a[1])[0] || ['N/A', 0];
+
+            insightList.innerHTML = segments.slice(0, 5).map(s => `
+                <div class="insight-item">
+                    <span class="left"><span class="dot" style="background:${s.color}"></span>${s.key.replace('_', ' ')}</span>
+                    <span>${s.pct.toFixed(0)}% · ${formatINR(s.amount)}</span>
+                </div>
+            `).join('') + `
+                <div class="insight-item">
+                    <span class="left">🏪 Top Vendor</span>
+                    <span>${bestVendor} · ${formatINR(bestAmount)}</span>
+                </div>
+            `;
+
+            const iconMap = {
+                invoice: '🧾',
+                receipt: '🍽️',
+                'product listing': '🛍️',
+                bill: '💳',
+                other: '📦'
+            };
+
+            categoryCards.innerHTML = segments.slice(0, 6).map(s => `
+                <div class="category-card">
+                    <div class="icon">${iconMap[s.key] || '📄'}</div>
+                    <div class="name">${s.key.replace('_', ' ')}</div>
+                    <div class="value">${formatINR(s.amount)}</div>
+                </div>
+            `).join('');
         }
 
         // Check current user on load
@@ -1182,6 +1394,7 @@ def dashboard(request: Request):
                 const res = await fetch(\'/api/documents\');
                 const docs = await res.json();
                 const tbody = document.getElementById(\'documents-table\');
+                renderVisualDashboard(docs);
 
                 if (docs.length === 0) {
                     tbody.innerHTML = \'<tr><td colspan="8" class="empty-state">No documents yet</td></tr>\';
