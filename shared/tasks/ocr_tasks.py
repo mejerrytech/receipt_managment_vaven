@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,31 +26,43 @@ ocr_service = get_ocr_service()
 
 
 def _run(coro):
-    """Run async code from Celery sync context."""
-    return asyncio.run(coro)
+    """
+    Run async code from Celery sync context safely.
+    If an event loop is already running in this thread, execute the coroutine
+    in a separate thread with its own event loop.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(lambda: asyncio.run(coro))
+        return future.result()
 
 
-def _send_telegram_message(chat_id: int, text: str, pending_id: int) -> Optional[int]:
+async def _send_telegram_message_async(chat_id: int, text: str, pending_id: int) -> Optional[int]:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token or not chat_id:
         return None
 
-    async def _send():
-        bot = Bot(token=token)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirm & Save", callback_data=f"confirm:{pending_id}")],
-            [InlineKeyboardButton("✏️ Edit Data", callback_data=f"edit:{pending_id}")]
-        ])
-        msg = await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
-        return msg.message_id
+    bot = Bot(token=token)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm & Save", callback_data=f"confirm:{pending_id}")],
+        [InlineKeyboardButton("✏️ Edit Data", callback_data=f"edit:{pending_id}")]
+    ])
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    return msg.message_id
 
+
+def _send_telegram_message(chat_id: int, text: str, pending_id: int) -> Optional[int]:
     try:
-        return _run(_send())
+        return _run(_send_telegram_message_async(chat_id=chat_id, text=text, pending_id=pending_id))
     except Exception:
         logger.exception("Failed to send OCR completion message for pending_id=%s", pending_id)
         return None
@@ -58,7 +71,7 @@ def _send_telegram_message(chat_id: int, text: str, pending_id: int) -> Optional
 def _send_telegram_ready(chat_id: int, pending_id: int, extracted_json: str, confidence: float) -> Optional[int]:
     async def _build_and_send():
         card_text = await build_upload_preview_card(extracted_json=extracted_json, confidence=confidence)
-        return _send_telegram_message(chat_id=chat_id, text=card_text, pending_id=pending_id)
+        return await _send_telegram_message_async(chat_id=chat_id, text=card_text, pending_id=pending_id)
 
     try:
         return _run(_build_and_send())
