@@ -387,24 +387,42 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Use conversation memory if enabled
         use_memory = settings.CONVERSATION_MEMORY_ENABLED
 
-        if db_user and nlp_service_v2.should_store_as_expense_text(user_text):
+        expense_decision = nlp_service_v2.classify_plain_text_expense(user_text)
+        if db_user and expense_decision.get("should_store"):
             try:
-                logger.info("Message classified as expense-related; saving text entry for user %s", db_user.id)
+                logger.info(
+                    "Message classified as expense-related; saving text entry for user %s category=%s",
+                    db_user.id,
+                    expense_decision.get("category"),
+                )
                 db_service.save_user_text_entry(
                     user_id=db_user.id,
                     user_text=user_text,
-                    intent_tag="expense_related_message"
+                    intent_tag="expense_related_message",
+                    expense_category=expense_decision.get("category"),
                 )
             except Exception:
                 logger.exception("Failed to persist expense-related user text for user %s", db_user.id)
-        
+
+        emotion = expense_decision.get("user_emotion") or "neutral"
+        system_prompt = settings.SYSTEM_PROMPT
+        system_prompt += (
+            f"\n\nTurn context: classify the user's tone as '{emotion}' for your reply style only "
+            f"(warmer if grateful/positive, calmer if stressed_or_urgent or negative, default if neutral/casual). "
+            f"Do not label their emotion unless they explicitly ask."
+        )
+        if expense_decision.get("should_store"):
+            system_prompt += (
+                "\nThis message was saved as a spending text entry; you may give a very short acknowledgment "
+                f"(category: {expense_decision.get('category')}) if it fits naturally, then stop."
+            )
+
         answer = await openai_service.ask(
             user_prompt=user_text,
-            system_prompt=settings.SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             chat_id=chat_id if use_memory else None,
             use_memory=use_memory
         )
-        
         # Send response (chunked if too long)
         await _reply_in_chunks(update, answer, settings.MAX_MESSAGE_LENGTH)
         
@@ -687,8 +705,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, result)
                 if duplicate_after_ocr:
                     await update.message.reply_text(
-                        "⚠️ Duplicate image detected.\n"
-                        "Ye document pehle se मौजूद hai (content match mila), naya save nahi kiya gaya."
+                        "⚠️ Duplicate image detected."
                     )
                     return
 
@@ -852,98 +869,36 @@ async def query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         # Format response based on result
         if result.get("success"):
-            # Check if it's a fallback/semantic search result
             if result.get("fallback"):
-                # Semantic search results - show TOP 3 matches with ALL fields
+                # Semantic path: one plain summary (LLM already uses DB / extracted_data)
                 data = result.get("data", [])
-                
-                if data:
-                    all_lines = []
-                    
-                    # Show top 3 results
-                    for idx, item in enumerate(data[:3], 1):
-                        lines = [f"{idx}. **{item.get('title', 'Document')}**"]
-                        
-                        # Define field icons and display order (aliases mapped to single fields)
-                        field_map = {
-                            'type': ('📄', 'Type'),  # Will also check document_type as alias
-                            'amount': ('💰', 'Amount'),  # Will also check total_amount as alias
-                            'vendor': ('🏪', 'Vendor'),  # Will also check vendor_name as alias
-                            'date': ('📅', 'Date'),  # Will also check document_date, created_at as aliases
-                            'currency': ('💵', 'Currency'),
-                            'invoice_number': ('🔢', 'Invoice #'),
-                            'gstin': ('🆔', 'GSTIN'),
-                            'file_name': ('📁', 'File'),
-                        }
-                        
-                        # Track which fields we've displayed (including aliases)
-                        displayed = set()
-                        
-                        # Show fields in preferred order with alias handling
-                        # Define all aliases to prevent duplicates
-                        all_aliases = {
-                            'type': ['type', 'document_type'],
-                            'amount': ['amount', 'total_amount'],
-                            'vendor': ['vendor', 'vendor_name'],
-                            'date': ['date', 'document_date', 'created_at']
-                        }
-                        
-                        for key, (icon, label) in field_map.items():
-                            val = None
-                            keys_to_check = all_aliases.get(key, [key])
-                            for k in keys_to_check:
-                                if k in item and item[k] is not None and k not in displayed:
-                                    val = item[k]
-                                    # Mark ALL aliases as displayed to prevent duplicates
-                                    for alias in keys_to_check:
-                                        displayed.add(alias)
-                                    break
-                            
-                            if val is not None:
-                                # Format amounts with currency (handle None currency)
-                                if key == 'amount' and isinstance(val, (int, float)):
-                                    currency = item.get('currency') or '₹'
-                                    val = f"{currency}{val:.2f}"
-                                lines.append(f"   {icon} {label}: {val}")
-                        
-                        # Show any remaining fields (not aliases of already shown)
-                        skip_fields = {'_text', '_score', 'title', 'user_id', 'id', 
-                                       'type', 'document_type', 'amount', 'total_amount',
-                                       'vendor', 'vendor_name', 'date', 'document_date', 'created_at'}
-                        for key, val in item.items():
-                            if key not in skip_fields and key not in displayed and val is not None:
-                                if not key.startswith('_'):
-                                    lines.append(f"   • {key}: {val}")
-                        
-                        all_lines.append("\n".join(lines))
-                    
-                    if len(data) > 3:
-                        all_lines.append(f"\n_... and {len(data) - 3} more results_")
+                ai_follow = (result.get("ai_response") or "").strip()
 
-                    await update.message.reply_text("\n\n".join(all_lines), parse_mode="Markdown")
+                if ai_follow:
+                    await update.message.reply_text(ai_follow[:4096])
+                elif data:
+                    parts = []
+                    for item in data[:3]:
+                        t = item.get("title") or "Document"
+                        v = (item.get("vendor") or "").strip()
+                        parts.append(f"{t}" + (f" ({v})" if v else ""))
+                    await update.message.reply_text(
+                        "Related: " + "; ".join(parts) + "."
+                    )
                 else:
                     await update.message.reply_text(
-                        "🔍 No matching documents found for your query.\n"
-                        "Try asking about specific topics or upload more documents!"
+                        "No matching documents found. Try other keywords or upload again."
                     )
             else:
-                # SQL query results - use LLM-generated summary
+                # SQL + formatter path: plain summary only
                 ai_response = result.get("ai_response")
                 if ai_response:
-                    try:
-                        await update.message.reply_text(ai_response, parse_mode="Markdown")
-                    except BadRequest as e:
-                        # Fallback to plain text if Markdown parsing fails
-                        if "parse entities" in str(e).lower():
-                            await update.message.reply_text(ai_response)
-                        else:
-                            raise
+                    await update.message.reply_text(str(ai_response)[:4096])
                 else:
-                    await update.message.reply_text("📊 Query executed successfully but no summary available.")
+                    await update.message.reply_text("Query ran but no summary was returned.")
         else:
-            # Error or no results
-            ai_response = result.get("ai_response", "I could not process your query. Please try rephrasing it.")
-            await update.message.reply_text(f"⚠️ {ai_response}")
+            ai_response = result.get("ai_response", "I could not process your query. Try rephrasing.")
+            await update.message.reply_text(str(ai_response)[:4096])
 
         latency = time.time() - start_time
         logger.info(f"Query processed for user {db_user.telegram_id}: '{query_text}' in {latency:.2f}s")

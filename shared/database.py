@@ -3,11 +3,12 @@ import json
 import logging
 import secrets
 import re
+import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, ForeignKey, BigInteger, Float, text
+from sqlalchemy import create_engine, inspect, Column, Integer, String, DateTime, Text, ForeignKey, BigInteger, Float, text, or_
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.sql import func
 
@@ -26,6 +27,27 @@ engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+def _is_postgresql() -> bool:
+    return engine.dialect.name == "postgresql"
+
+
+def _timestamp_column_type_sql() -> str:
+    """SQLite uses DATETIME; PostgreSQL should use a proper timestamp type."""
+    return "TIMESTAMP WITH TIME ZONE" if _is_postgresql() else "DATETIME"
+
+
+def _table_column_names(table_name: str) -> set:
+    """Return lowercase column names for SQLite / PostgreSQL (no PRAGMA — works on both)."""
+    try:
+        insp = inspect(engine)
+        if not insp.has_table(table_name):
+            return set()
+        return {c["name"].lower() for c in insp.get_columns(table_name)}
+    except Exception as e:
+        logger.warning("Could not introspect table %s: %s", table_name, e)
+        return set()
 
 
 class User(Base):
@@ -246,10 +268,10 @@ def init_db():
 
 
 def _ensure_hash_columns():
-    """Lightweight migration to add hash columns on existing SQLite tables."""
+    """Lightweight migration to add hash columns on existing tables (SQLite + PostgreSQL)."""
     with engine.connect() as conn:
         for table in ("documents", "pending_documents"):
-            cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+            cols = _table_column_names(table)
             if "telegram_file_unique_id" not in cols:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN telegram_file_unique_id VARCHAR(255)"))
             if "content_sha256" not in cols:
@@ -263,8 +285,9 @@ def _ensure_hash_columns():
 
 def _ensure_pending_queue_columns():
     """Add queue-tracking columns on pending_documents for existing DBs."""
+    ts_type = _timestamp_column_type_sql()
     with engine.connect() as conn:
-        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(pending_documents)"))}
+        cols = _table_column_names("pending_documents")
         if "telegram_file_id" not in cols:
             conn.execute(text("ALTER TABLE pending_documents ADD COLUMN telegram_file_id VARCHAR(255)"))
         if "ocr_job_id" not in cols:
@@ -274,16 +297,16 @@ def _ensure_pending_queue_columns():
         if "error_message" not in cols:
             conn.execute(text("ALTER TABLE pending_documents ADD COLUMN error_message TEXT"))
         if "ocr_started_at" not in cols:
-            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN ocr_started_at DATETIME"))
+            conn.execute(text(f"ALTER TABLE pending_documents ADD COLUMN ocr_started_at {ts_type}"))
         if "ocr_completed_at" not in cols:
-            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN ocr_completed_at DATETIME"))
+            conn.execute(text(f"ALTER TABLE pending_documents ADD COLUMN ocr_completed_at {ts_type}"))
         conn.commit()
 
 
 def _ensure_expense_category_columns():
     """Add expense_category column on documents for existing DBs."""
     with engine.connect() as conn:
-        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(documents)"))}
+        cols = _table_column_names("documents")
         if "expense_category" not in cols:
             conn.execute(text("ALTER TABLE documents ADD COLUMN expense_category VARCHAR(50)"))
         conn.commit()
@@ -292,10 +315,10 @@ def _ensure_expense_category_columns():
 def _ensure_user_input_text_columns():
     """Add user_input_text columns for persisted user-entered upload text."""
     with engine.connect() as conn:
-        doc_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(documents)"))}
+        doc_cols = _table_column_names("documents")
         if "user_input_text" not in doc_cols:
             conn.execute(text("ALTER TABLE documents ADD COLUMN user_input_text TEXT"))
-        pending_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(pending_documents)"))}
+        pending_cols = _table_column_names("pending_documents")
         if "user_input_text" not in pending_cols:
             conn.execute(text("ALTER TABLE pending_documents ADD COLUMN user_input_text TEXT"))
         conn.commit()
@@ -304,7 +327,11 @@ def _ensure_user_input_text_columns():
 def _ensure_user_text_entry_amount_columns():
     """Add amount/currency columns on user_text_entries for existing DBs."""
     with engine.connect() as conn:
-        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(user_text_entries)"))}
+        insp = inspect(engine)
+        if not insp.has_table("user_text_entries"):
+            conn.commit()
+            return
+        cols = _table_column_names("user_text_entries")
         if "amount" not in cols:
             conn.execute(text("ALTER TABLE user_text_entries ADD COLUMN amount FLOAT"))
         if "currency" not in cols:
@@ -346,69 +373,28 @@ class DatabaseService:
         "Other",
     ]
 
-    CATEGORY_KEYWORDS = {
-        "Food and Dining": ["restaurant", "food", "dining", "zomato", "swiggy", "cafe", "hotel", "meal"],
-        "Groceries": ["grocery", "groceries", "supermarket", "mart", "kirana", "vegetable", "milk", "provision"],
-        "Rent": ["rent", "landlord", "lease", "tenancy"],
-        "Utilities": ["electricity", "water bill", "internet", "wifi", "broadband", "gas bill", "utility", "phone bill", "mobile recharge"],
-        "Fual": ["fuel", "petrol", "diesel", "indianoil", "hpcl", "bpcl", "gas station"],
-        "Shopping": ["shopping", "store", "amazon", "flipkart", "retail", "purchase", "mall"],
-        "Entertainment": ["movie", "cinema", "netflix", "spotify", "hotstar", "game", "concert"],
-        "Healthcare": ["hospital", "clinic", "pharmacy", "medicine", "medical", "doctor", "lab test", "diagnostic"],
-        "Edication": ["school", "college", "tuition", "course", "education", "training", "book fee", "exam"],
-        "Personal care": ["salon", "spa", "cosmetic", "grooming", "personal care", "parlor"],
-        "Subscription": ["subscription", "renewal", "monthly plan", "membership", "saas", "icloud", "google one"],
-        "EMI/Loans": ["emi", "loan", "installment", "repayment", "finance charge"],
-        "Insurance": ["insurance", "premium", "policy", "lic"],
-        "Investment": ["investment", "mutual fund", "sip", "stock", "brokerage", "demat", "equity", "bond"],
-        "Travel": ["flight", "train", "bus", "hotel booking", "travel", "trip", "airlines", "irctc"],
-        "Savings": ["savings", "deposit", "fd", "rd", "recurring deposit", "piggy"],
-        "CAB/Taxi": ["cab", "taxi", "uber", "ola", "rapido", "auto fare"],
-        "Misecellaneous": ["misc", "miscellaneous", "others", "general expense"],
-    }
-
     @staticmethod
-    def _extract_classification_text(data: dict, raw_text: Optional[str], file_name: Optional[str]) -> str:
-        amounts = data.get("amounts", {}) if isinstance(data.get("amounts"), dict) else {}
-        vendor = data.get("vendor_or_sender", {}) if isinstance(data.get("vendor_or_sender"), dict) else {}
-        items = data.get("items", []) if isinstance(data.get("items"), list) else []
-        parts = [
-            str(data.get("title") or ""),
-            str(data.get("document_type") or ""),
-            str(data.get("date") or ""),
-            str(vendor.get("name") or data.get("vendor_name") or ""),
-            str(raw_text or ""),
-            str(data.get("text_content") or ""),
-            str(file_name or ""),
-            str(amounts.get("currency") or ""),
-        ]
-        for item in items[:25]:
-            if isinstance(item, dict):
-                parts.append(str(item.get("description") or item.get("name") or ""))
-        merged = " ".join(parts)
-        return re.sub(r"\s+", " ", merged).strip().lower()
-
-    @staticmethod
-    def _classify_expense_category(data: dict, raw_text: Optional[str], file_name: Optional[str]) -> str:
-        text_blob = DatabaseService._extract_classification_text(data, raw_text, file_name)
-        if not text_blob:
+    def normalize_expense_category_label(raw: Optional[str]) -> str:
+        """Map any model/OCR string to a canonical value in EXPENSE_CATEGORIES."""
+        c = (raw or "").strip()
+        if not c:
             return "Other"
-
-        # Score each category by keyword hits and choose the strongest intent.
-        best_category = "Other"
-        best_score = 0
-        for category, keywords in DatabaseService.CATEGORY_KEYWORDS.items():
-            score = sum(1 for kw in keywords if kw in text_blob)
-            if score > best_score:
-                best_score = score
-                best_category = category
-        return best_category if best_category in DatabaseService.EXPENSE_CATEGORIES else "Other"
+        if c in DatabaseService.EXPENSE_CATEGORIES:
+            return c
+        by_lower = {x.lower(): x for x in DatabaseService.EXPENSE_CATEGORIES}
+        return by_lower.get(c.lower(), "Other")
 
     @staticmethod
-    def classify_text_to_expense_category(user_text: str) -> str:
-        """Classify plain user text into one of configured expense categories."""
-        data = {"text_content": user_text}
-        return DatabaseService._classify_expense_category(data, user_text, None)
+    def _resolve_document_expense_category(
+        data: dict,
+        _merged_input_text: Optional[str],
+        _file_name: Optional[str],
+    ) -> str:
+        """Category comes only from OCR JSON `expense_category` (normalized); no keyword tables."""
+        ocr_raw = data.get("expense_category")
+        if isinstance(ocr_raw, str):
+            return DatabaseService.normalize_expense_category_label(ocr_raw.strip())
+        return DatabaseService.normalize_expense_category_label(None)
 
     @staticmethod
     def _extract_amount_from_text(user_text: str) -> Optional[float]:
@@ -493,7 +479,9 @@ class DatabaseService:
             identifiers = data.get("identifiers", {})
             confidence = data.get("confidence", {})
             merged_input_text = " ".join([x for x in [raw_text, user_input_text] if x]).strip() or None
-            classified_category = DatabaseService._classify_expense_category(data, merged_input_text, file_name)
+            classified_category = DatabaseService._resolve_document_expense_category(
+                data, merged_input_text, file_name
+            )
 
             doc = Document(
                 user_id=user_id,
@@ -524,26 +512,8 @@ class DatabaseService:
             db.refresh(doc)
             logger.info(f"Saved document: {doc}")
 
-            # Also add to vector database for semantic search (fire and forget)
-            try:
-                vector_service = get_vector_service()
-                doc_dict = {
-                    "id": doc.id,
-                    "user_id": doc.user_id,
-                    "file_name": doc.file_name,
-                    "document_type": doc.document_type,
-                    "title": doc.title,
-                    "vendor_name": doc.vendor_name,
-                    "expense_category": doc.expense_category,
-                    "user_input_text": doc.user_input_text,
-                    "total_amount": doc.total_amount,
-                    "extracted_json": doc.extracted_data,
-                    "document_date": doc.document_date,
-                    "raw_text": doc.raw_text
-                }
-                vector_service.add_document(doc.id, doc.user_id, doc_dict)
-            except Exception as e:
-                logger.warning(f"Failed to add document {doc.id} to vector DB (non-critical): {e}")
+            # Chroma / OpenAI vector index (required for /q semantic search)
+            DatabaseService.index_document_in_vector_store(doc)
 
             return doc
         except Exception as e:
@@ -554,14 +524,138 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def save_user_text_entry(user_id: int, user_text: str, intent_tag: str = "expense_text") -> Optional[UserTextEntry]:
+    def _vector_payload_from_document(doc: Document) -> Dict[str, Any]:
+        """Shape expected by vector_service._document_to_text (extracted_json key)."""
+        return {
+            "id": doc.id,
+            "user_id": doc.user_id,
+            "file_name": doc.file_name,
+            "document_type": doc.document_type,
+            "title": doc.title,
+            "vendor_name": doc.vendor_name,
+            "expense_category": doc.expense_category,
+            "user_input_text": doc.user_input_text,
+            "total_amount": doc.total_amount,
+            "extracted_json": doc.extracted_data,
+            "document_date": doc.document_date,
+            "raw_text": doc.raw_text,
+        }
+
+    @staticmethod
+    def index_document_in_vector_store(doc: Document, attempts: int = 3) -> bool:
+        """Upsert document embedding in Chroma after SQL commit. Retries on failure."""
+        vs = get_vector_service()
+        payload = DatabaseService._vector_payload_from_document(doc)
+        for i in range(attempts):
+            if vs.add_document(int(doc.id), int(doc.user_id), payload):
+                return True
+            logger.warning(
+                "Vector upsert attempt %s/%s failed for document id=%s",
+                i + 1,
+                attempts,
+                doc.id,
+            )
+            time.sleep(0.5 * (i + 1))
+        logger.error(
+            "VECTOR INDEX FAILED: document id=%s user_id=%s saved in SQL but semantic search will NOT find it "
+            "(check OPENAI_API_KEY, network, CHROMA_DB_PATH). Re-run DatabaseService.reindex_document_vector(%s, %s).",
+            doc.id,
+            doc.user_id,
+            doc.id,
+            doc.user_id,
+        )
+        return False
+
+    @staticmethod
+    def index_user_text_entry_in_vector(entry: UserTextEntry, attempts: int = 3) -> bool:
+        vs = get_vector_service()
+        for i in range(attempts):
+            if vs.add_user_text_entry(
+                entry_id=int(entry.id),
+                user_id=int(entry.user_id),
+                text=entry.text,
+                intent_tag=entry.intent_tag or "expense_text",
+                expense_category=entry.expense_category,
+            ):
+                return True
+            logger.warning(
+                "Vector upsert attempt %s/%s failed for user_text_entries id=%s",
+                i + 1,
+                attempts,
+                entry.id,
+            )
+            time.sleep(0.5 * (i + 1))
+        logger.error(
+            "VECTOR INDEX FAILED: user_text_entries id=%s user_id=%s not in Chroma — manual expense text search broken.",
+            entry.id,
+            entry.user_id,
+        )
+        return False
+
+    @staticmethod
+    def reindex_document_vector(doc_id: int, user_id: int) -> bool:
+        """Reload document from SQL and push to Chroma (recovery after failed indexing)."""
+        doc = DatabaseService.get_document_by_id(doc_id, user_id)
+        if not doc:
+            logger.warning("reindex_document_vector: no document id=%s for user_id=%s", doc_id, user_id)
+            return False
+        return DatabaseService.index_document_in_vector_store(doc)
+
+    @staticmethod
+    def find_documents_matching_query_tokens(user_id: int, query: str, limit: int = 10) -> List[Document]:
+        """
+        SQL substring fallback for /q when embedding search misses (vendor name in JSON, etc.).
+        Matches vendor_name, title, raw_text, extracted_data using meaningful tokens from the question.
+        """
+        q = (query or "").strip()
+        if len(q) < 2:
+            return []
+        words = re.findall(r"[A-Za-z][\w.-]{2,}", q)
+        needles: List[str] = []
+        if words:
+            needles.append(max(words, key=len).lower())
+        needles.extend([w.lower() for w in words if len(w) >= 4])
+        needles = list(dict.fromkeys(needles))[:8]
+        if not needles:
+            needles = [q[:120].lower()]
+        db = get_db()
+        try:
+            conds = []
+            for n in needles:
+                pat = f"%{n}%"
+                conds.append(Document.vendor_name.ilike(pat))
+                conds.append(Document.title.ilike(pat))
+                conds.append(Document.raw_text.ilike(pat))
+                conds.append(Document.extracted_data.ilike(pat))
+            return (
+                db.query(Document)
+                .filter(Document.user_id == user_id)
+                .filter(or_(*conds))
+                .order_by(Document.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+        finally:
+            db.close()
+
+    @staticmethod
+    def save_user_text_entry(
+        user_id: int,
+        user_text: str,
+        intent_tag: str = "expense_text",
+        expense_category: Optional[str] = None,
+    ) -> Optional[UserTextEntry]:
         """Persist expense-related user text and index it in vector DB."""
         db = get_db()
         try:
             cleaned = (user_text or "").strip()
             if not cleaned:
                 return None
-            category = DatabaseService.classify_text_to_expense_category(cleaned)
+            cat_candidate = (expense_category or "").strip()
+            if cat_candidate in DatabaseService.EXPENSE_CATEGORIES:
+                category = cat_candidate
+            else:
+                category = DatabaseService.normalize_expense_category_label(cat_candidate or None)
             amount = DatabaseService._extract_amount_from_text(cleaned)
             entry = UserTextEntry(
                 user_id=user_id,
@@ -575,16 +669,7 @@ class DatabaseService:
             db.commit()
             db.refresh(entry)
 
-            try:
-                vector_service = get_vector_service()
-                vector_service.add_user_text_entry(
-                    entry_id=entry.id,
-                    user_id=user_id,
-                    text=cleaned,
-                    intent_tag=intent_tag
-                )
-            except Exception as e:
-                logger.warning(f"Failed to add text entry {entry.id} to vector DB (non-critical): {e}")
+            DatabaseService.index_user_text_entry_in_vector(entry)
 
             logger.info(f"Saved user text entry: id={entry.id}, user_id={user_id}, category={category}")
             return entry
@@ -615,6 +700,78 @@ class DatabaseService:
                 Document.id == doc_id,
                 Document.user_id == user_id
             ).first()
+        finally:
+            db.close()
+
+    @staticmethod
+    def fetch_documents_for_vector_enrichment(user_id: int, doc_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """Batch-load documents for semantic / vector search enrichment (Postgres or SQLite)."""
+        if not doc_ids:
+            return {}
+        db = get_db()
+        try:
+            docs = (
+                db.query(Document)
+                .filter(Document.user_id == user_id, Document.id.in_(doc_ids))
+                .all()
+            )
+            out: Dict[int, Dict[str, Any]] = {}
+            for d in docs:
+                out[d.id] = {
+                    "id": d.id,
+                    "document_type": d.document_type,
+                    "title": d.title,
+                    "total_amount": d.total_amount,
+                    "vendor_name": d.vendor_name,
+                    "created_at": d.created_at.isoformat() if d.created_at else None,
+                    "document_date": d.document_date,
+                    "extracted_data": d.extracted_data,
+                }
+            return out
+        finally:
+            db.close()
+
+    @staticmethod
+    def fetch_user_text_entries_for_vector_enrichment(
+        user_id: int, entry_ids: List[int]
+    ) -> Dict[int, Dict[str, Any]]:
+        """Batch-load manual text expense rows for vector enrichment."""
+        if not entry_ids:
+            return {}
+        db = get_db()
+        try:
+            rows = (
+                db.query(UserTextEntry)
+                .filter(UserTextEntry.user_id == user_id, UserTextEntry.id.in_(entry_ids))
+                .all()
+            )
+            out: Dict[int, Dict[str, Any]] = {}
+            for t in rows:
+                out[t.id] = {
+                    "id": t.id,
+                    "text": t.text,
+                    "amount": t.amount,
+                    "currency": t.currency,
+                    "expense_category": t.expense_category,
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                }
+            return out
+        finally:
+            db.close()
+
+    @staticmethod
+    def get_distinct_vendor_names(user_id: int, limit: int = 500) -> List[str]:
+        """Distinct vendor names for a user (helper for NLP user_info replies)."""
+        db = get_db()
+        try:
+            rows = (
+                db.query(Document.vendor_name)
+                .filter(Document.user_id == user_id, Document.vendor_name.isnot(None))
+                .distinct()
+                .limit(limit)
+                .all()
+            )
+            return [r[0] for r in rows if r and r[0]]
         finally:
             db.close()
 

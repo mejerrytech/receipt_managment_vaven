@@ -10,6 +10,7 @@ This service provides:
 import os
 import json
 import logging
+import time
 from typing import List, Dict, Any, Optional
 import openai
 from dotenv import load_dotenv
@@ -58,34 +59,43 @@ class VectorService:
 
         logger.info(f"VectorService initialized with OpenAI embeddings and ChromaDB at {CHROMA_DB_PATH}")
 
-    def _generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text using OpenAI with caching."""
+    def _generate_embedding(self, text: str, max_retries: int = 4) -> List[float]:
+        """Generate embedding for text using OpenAI with caching and transient-error retries."""
         import hashlib
         global _embedding_cache
 
-        # Create cache key from text hash
         cache_key = hashlib.md5(text[:8000].encode()).hexdigest()
 
-        # Check cache first
         if cache_key in _embedding_cache:
             logger.debug(f"Embedding cache hit for key {cache_key[:8]}")
             return _embedding_cache[cache_key]
 
-        try:
-            response = self.openai_client.embeddings.create(
-                model=self.embedding_model,
-                input=text[:8000]
-            )
-            embedding = response.data[0].embedding
+        last_err: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                response = self.openai_client.embeddings.create(
+                    model=self.embedding_model,
+                    input=text[:8000]
+                )
+                embedding = response.data[0].embedding
 
-            # Store in cache (with size limit)
-            if len(_embedding_cache) < _MAX_CACHE_SIZE:
-                _embedding_cache[cache_key] = embedding
+                if len(_embedding_cache) < _MAX_CACHE_SIZE:
+                    _embedding_cache[cache_key] = embedding
 
-            return embedding
-        except Exception as e:
-            logger.error(f"Failed to generate embedding: {e}")
-            raise
+                return embedding
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    "Embedding attempt %s/%s failed: %s",
+                    attempt + 1,
+                    max_retries,
+                    e,
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(min(2.0, 0.4 * (2**attempt)))
+
+        logger.error(f"Failed to generate embedding after {max_retries} attempts: {last_err}")
+        raise last_err if last_err else RuntimeError("embedding failed")
 
     def _flatten_json_for_search(self, data: Any, prefix: str = "") -> List[str]:
         """Recursively flatten JSON so nested fields (e.g. address/location) are searchable."""
@@ -109,6 +119,9 @@ class VectorService:
         # Add title
         if doc.get('title'):
             parts.append(f"Title: {doc['title']}")
+
+        if doc.get('expense_category'):
+            parts.append(f"Category: {doc['expense_category']}")
 
         # Add document type
         if doc.get('document_type'):
@@ -157,16 +170,23 @@ class VectorService:
             # Generate embedding
             embedding = self._generate_embedding(text)
 
+            ec = doc_data.get("expense_category")
+            uid = int(user_id)
+            did = int(doc_id)
+            meta_base = {
+                "user_id": uid,
+                "doc_id": did,
+                "text": text[:1000],
+            }
+            if ec:
+                meta_base["expense_category"] = str(ec)[:80]
+
             # Try to add to ChromaDB
             try:
                 self.collection.upsert(
                     ids=[str(doc_id)],
                     embeddings=[embedding],
-                    metadatas=[{
-                        "user_id": user_id,
-                        "doc_id": doc_id,
-                        "text": text[:1000]  # Store truncated text for display
-                    }],
+                    metadatas=[meta_base],
                     documents=[text]
                 )
             except Exception as e:
@@ -183,11 +203,7 @@ class VectorService:
                     self.collection.upsert(
                         ids=[str(doc_id)],
                         embeddings=[embedding],
-                        metadatas=[{
-                            "user_id": user_id,
-                            "doc_id": doc_id,
-                            "text": text[:1000]  # Store truncated text for display
-                        }],
+                        metadatas=[meta_base],
                         documents=[text]
                     )
                 else:
@@ -200,7 +216,14 @@ class VectorService:
             logger.error(f"Failed to add document {doc_id} to vector DB: {e}")
             return False
 
-    def add_user_text_entry(self, entry_id: int, user_id: int, text: str, intent_tag: str = "expense_text") -> bool:
+    def add_user_text_entry(
+        self,
+        entry_id: int,
+        user_id: int,
+        text: str,
+        intent_tag: str = "expense_text",
+        expense_category: Optional[str] = None,
+    ) -> bool:
         """Add user free-text entry to vector DB for semantic recall."""
         try:
             normalized_text = (text or "").strip()
@@ -209,16 +232,20 @@ class VectorService:
 
             embedding = self._generate_embedding(normalized_text)
             vector_id = f"text_entry_{entry_id}"
+            meta = {
+                "user_id": int(user_id),
+                "doc_id": -int(entry_id),
+                "type": "user_text_entry",
+                "intent_tag": intent_tag,
+                "text": normalized_text[:1000],
+            }
+            if expense_category:
+                meta["expense_category"] = str(expense_category)[:80]
+
             self.collection.upsert(
                 ids=[vector_id],
                 embeddings=[embedding],
-                metadatas=[{
-                    "user_id": user_id,
-                    "doc_id": -entry_id,  # keep numeric-compatible metadata slot
-                    "type": "user_text_entry",
-                    "intent_tag": intent_tag,
-                    "text": normalized_text[:1000],
-                }],
+                metadatas=[meta],
                 documents=[normalized_text]
             )
             logger.info(f"Added user text entry {entry_id} to vector DB for user {user_id}")
@@ -265,7 +292,7 @@ class VectorService:
                 results = self.collection.query(
                     query_embeddings=[query_embedding],
                     n_results=n_results,
-                    where={"user_id": user_id},  # 🔐 GUARDRAIL: Only user's own documents
+                    where={"user_id": int(user_id)},
                     include=["metadatas", "documents", "distances"]
                 )
             except Exception as e:
@@ -311,6 +338,7 @@ class VectorService:
                             "entry_type": "user_text_entry",
                             "user_id": metadata.get("user_id", user_id),
                             "text": document[:500],
+                            "expense_category": metadata.get("expense_category"),
                             "similarity_score": round(similarity, 2),
                             "source": "vector_search"
                         })
@@ -328,6 +356,7 @@ class VectorService:
                         "entry_type": "document",
                         "user_id": metadata.get("user_id", user_id),
                         "text": document[:500],  # Truncate for display
+                        "expense_category": metadata.get("expense_category"),
                         "similarity_score": round(similarity, 2),
                         "source": "vector_search"
                     })
@@ -370,7 +399,7 @@ class VectorService:
             similar = self.collection.query(
                 query_embeddings=result['embeddings'],
                 n_results=n_results + 1,  # +1 to exclude the document itself
-                where={"user_id": user_id},  # 🔐 GUARDRAIL
+                where={"user_id": int(user_id)},
                 include=["metadatas", "documents", "distances"]
             )
 

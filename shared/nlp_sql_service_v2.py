@@ -10,19 +10,72 @@ This version uses the orchestrator to:
 import os
 import json
 import logging
-import sqlite3
 import re
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 
 # Import orchestration layer
+from sqlalchemy import text
+
 from shared.orchestrator import get_orchestrator, AgentType, ModelProvider, AgentStep
 from shared.vector_service import get_vector_service
-from shared.database import DatabaseService
+from shared.database import DatabaseService, engine
 
 load_dotenv()
 
 logger = logging.getLogger("nlp_sql_v2")
+
+
+def _parse_extracted_json_column(raw: Any) -> Any:
+    """Parse documents.extracted_data (JSON text). No field-specific logic."""
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    return None
+
+
+def _rows_for_llm(filtered_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """LLM context from DB only (user-scoped rows): columns + full extracted_data JSON."""
+    rows: List[Dict[str, Any]] = []
+    for item in filtered_data:
+        kind = item.get("entry_kind") or item.get("type")
+        if kind == "user_text_entry":
+            rows.append({
+                "entry_kind": "user_text_entry",
+                "text_entry_id": item.get("text_entry_id"),
+                "text": item.get("user_text_body"),
+                "amount": item.get("amount"),
+                "currency": item.get("currency"),
+                "expense_category": item.get("expense_category"),
+                "created_at": item.get("date"),
+                "similarity_pct": item.get("_score"),
+            })
+            continue
+
+        ext = item.get("extracted_data")
+        parsed = _parse_extracted_json_column(ext)
+        row: Dict[str, Any] = {
+            "entry_kind": "document",
+            "document_id": item.get("id"),
+            "vendor_name": item.get("vendor"),
+            "total_amount": item.get("amount"),
+            "title": item.get("title"),
+            "document_date": item.get("date"),
+            "similarity_pct": item.get("_score"),
+        }
+        if parsed is not None:
+            row["extracted_data"] = parsed
+        elif isinstance(ext, str) and ext.strip():
+            row["extracted_data_raw"] = ext[:20000]
+        rows.append(row)
+    return rows
+
 
 # Database schema for context
 DB_SCHEMA = """
@@ -164,7 +217,7 @@ CLASSIFY_SUMMARY_ROUTING_FUNCTION = {
 # Function schema for deciding whether plain user text should be stored
 CLASSIFY_STORAGE_DECISION_FUNCTION = {
     "name": "classify_storage_decision",
-    "description": "Decide whether a plain user text should be saved as expense-related entry",
+    "description": "Decide whether a plain user text should be saved as expense-related entry, assign exact category, and infer emotional tone",
     "parameters": {
         "type": "object",
         "properties": {
@@ -174,7 +227,12 @@ CLASSIFY_STORAGE_DECISION_FUNCTION = {
             },
             "category": {
                 "type": "string",
-                "description": "Best-fit expense category if should_store is true, else Other"
+                "description": "Must be exactly one string from the expense category list provided in the system prompt (use 'Other' if unclear)"
+            },
+            "user_emotion": {
+                "type": "string",
+                "enum": ["neutral", "positive", "negative", "stressed_or_urgent", "grateful", "casual"],
+                "description": "Overall emotional tone of the message (for reply styling), independent of should_store"
             },
             "reason": {
                 "type": "string",
@@ -185,7 +243,7 @@ CLASSIFY_STORAGE_DECISION_FUNCTION = {
                 "description": "Confidence between 0 and 1"
             }
         },
-        "required": ["should_store", "category", "reason", "confidence"]
+        "required": ["should_store", "category", "user_emotion", "reason", "confidence"]
     }
 }
 
@@ -442,33 +500,44 @@ Use the classify_intent function to provide your classification."""
             "provider_used": "fallback"
         }
 
-    def should_store_as_expense_text(self, user_text: str) -> bool:
+    def _normalize_expense_category_label(self, raw: Optional[str]) -> str:
+        """Map model output to a canonical category from DatabaseService.EXPENSE_CATEGORIES."""
+        return DatabaseService.normalize_expense_category_label(raw)
+
+    def classify_plain_text_expense(self, user_text: str) -> Dict[str, Any]:
         """
-        Decide whether a plain user message should be saved as expense text.
-        Fully prompt-driven dynamic decision (no static keyword gating).
+        Classify a plain Telegram message: expense vs non-expense, exact category (if expense),
+        emotional tone, and confidence. Used for DB + vector persistence and reply styling.
         """
         text = (user_text or "").strip()
+        empty = {
+            "should_store": False,
+            "category": "Other",
+            "user_emotion": "neutral",
+            "confidence": 0.0,
+        }
         if not text:
-            return False
+            return empty
         logger.info("Storage decision: evaluating user text intent: '%s'", text)
 
-        category_list = ", ".join(self.expense_categories)
-        system_prompt = f"""You decide if a user's plain message should be saved as an expense entry in database.
+        category_lines = "\n".join(f"- {c}" for c in self.expense_categories)
+        system_prompt = f"""You classify a user's plain chat message for a receipt/expense Telegram bot.
 
-Expense categories:
-{category_list}
+ALLOWED expense categories (category MUST be exactly one of these strings, character-for-character):
+{category_lines}
 
-Decision rules (strict):
-1. should_store=true only if user is stating/logging an expense/payment/amount actually spent.
-2. should_store=false for greetings, Q&A, follow-up questions, analysis queries, or general chat.
-3. If uncertain, prefer should_store=false.
-4. Choose category from provided list; if not clear, category=Other.
-5. Reply only through function call."""
+Tasks:
+1) should_store: true only if the user is logging or stating money they spent or paid (expense, bill paid, rent paid, purchase, etc.). false for greetings, thanks, bot help, questions about past data, jokes, or unclear intent.
+2) category: If should_store is true, pick the single best category from the list above. If should_store is false, still output category=Other.
+3) user_emotion: How the user sounds emotionally (for reply tone) — neutral, positive, negative, stressed_or_urgent, grateful, or casual.
+4) confidence: 0–1 for your should_store decision.
+5) If unsure about storing, prefer should_store=false.
+6) Reply only via the classify_storage_decision function call."""
 
         user_message = f"""User message:
-"{text}"
+\"\"\"{text}\"\"\"
 
-Decide storage now."""
+Classify now."""
 
         try:
             result = self.orchestrator.execute_with_fallback(
@@ -476,26 +545,48 @@ Decide storage now."""
                 user_message=user_message,
                 functions=[CLASSIFY_STORAGE_DECISION_FUNCTION],
                 temperature=0.1,
-                max_tokens=300
+                max_tokens=400
             )
             if result.success and result.function_calls:
                 func_call = result.function_calls[0]
                 args = func_call.get("arguments", {})
                 if isinstance(args, str):
                     args = json.loads(args)
-                should_store = bool(args.get("should_store", False))
+                should_store_raw = bool(args.get("should_store", False))
                 confidence = float(args.get("confidence", 0.0) or 0.0)
+                category_norm = self._normalize_expense_category_label(args.get("category"))
+                emotion = args.get("user_emotion") or "neutral"
+                if emotion not in (
+                    "neutral",
+                    "positive",
+                    "negative",
+                    "stressed_or_urgent",
+                    "grateful",
+                    "casual",
+                ):
+                    emotion = "neutral"
+                final_store = should_store_raw and confidence >= 0.55
                 logger.info(
-                    "Storage decision result: should_store=%s confidence=%.2f category=%s",
-                    should_store,
+                    "Storage decision result: should_store=%s confidence=%.2f category=%s emotion=%s",
+                    final_store,
                     confidence,
-                    args.get("category", "Other")
+                    category_norm if final_store else "Other",
+                    emotion,
                 )
-                return should_store and confidence >= 0.55
+                return {
+                    "should_store": final_store,
+                    "category": category_norm if final_store else "Other",
+                    "user_emotion": emotion,
+                    "confidence": confidence,
+                }
         except Exception:
             logger.exception("Expense-text storage decision failed")
 
-        return False
+        return empty
+
+    def should_store_as_expense_text(self, user_text: str) -> bool:
+        """Backward-compatible: true if plain text should be persisted as an expense entry."""
+        return bool(self.classify_plain_text_expense(user_text).get("should_store"))
 
     def generate_sql(self, user_query: str, user_id: int) -> Dict[str, Any]:
         """
@@ -715,27 +806,25 @@ Use the generate_sql_query function to provide your SQL."""
             "provider_used": "failed"
         }
 
-    def execute_query(self, sql: str, db_path: str = "bot_data.db") -> Dict[str, Any]:
-        """Execute SQL query and return results."""
+    def execute_query(self, sql: str, db_path: str = None) -> Dict[str, Any]:
+        """Execute SQL against the configured app database (SQLite or PostgreSQL via DATABASE_URL)."""
         try:
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with engine.connect() as conn:
+                result = conn.execute(text(sql))
+                if result.returns_rows:
+                    rows_raw = result.mappings().all()
+                    result_rows = [dict(row) for row in rows_raw]
+                    columns = list(result.keys())
+                else:
+                    result_rows = []
+                    columns = []
 
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-
-            columns = [description[0] for description in cursor.description] if cursor.description else []
-            result_rows = [dict(row) for row in rows]
-
-            conn.close()
-
-            return {
-                "columns": columns,
-                "rows": result_rows,
-                "row_count": len(result_rows),
-                "error": None
-            }
+                return {
+                    "columns": columns,
+                    "rows": result_rows,
+                    "row_count": len(result_rows),
+                    "error": None,
+                }
 
         except Exception as e:
             logger.error(f"Error executing SQL: {e}")
@@ -743,7 +832,7 @@ Use the generate_sql_query function to provide your SQL."""
                 "columns": [],
                 "rows": [],
                 "row_count": 0,
-                "error": str(e)
+                "error": str(e),
             }
 
     def _generate_social_response(self, user_query: str, mode: str = "conversation") -> str:
@@ -878,13 +967,8 @@ Generate one short assistant reply."""
         if intent == "user_info":
             # Check if user wants to see vendors
             if "vendor" in user_query.lower() or "seller" in user_query.lower():
-                conn = sqlite3.connect(db_path)
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                cursor.execute("SELECT DISTINCT vendor_name FROM documents WHERE user_id = ? AND vendor_name IS NOT NULL", (user_id,))
-                vendors = [row[0] for row in cursor.fetchall()]
-                conn.close()
-                
+                vendors = DatabaseService.get_distinct_vendor_names(user_id)
+
                 if vendors:
                     response = f"Aapke documents me ye vendors hain: {', '.join(vendors)}"
                 else:
@@ -1148,6 +1232,39 @@ Answer directly in a conversational way.{context}"""
             )
             logger.info(f"Vector search with context: query_len={len(user_query)}, context_len={len(context)}")
 
+            # Supplement embedding hits with SQL substring match on vendor / extracted_data / title
+            # (fixes "docubee" queries when Chroma similarity is weak or index stale).
+            seen_doc_ids: set = set()
+            merged_results: List[Dict[str, Any]] = []
+            for r in results:
+                merged_results.append(dict(r))
+                did = r.get("doc_id")
+                if did is not None:
+                    try:
+                        seen_doc_ids.add(int(did))
+                    except (TypeError, ValueError):
+                        pass
+            try:
+                for doc in DatabaseService.find_documents_matching_query_tokens(user_id, user_query):
+                    if doc.id not in seen_doc_ids:
+                        seen_doc_ids.add(doc.id)
+                        merged_results.append({
+                            "doc_id": doc.id,
+                            "text_entry_id": None,
+                            "entry_type": "document",
+                            "user_id": user_id,
+                            "text": "",
+                            "similarity_score": 55.0,
+                            "source": "sql_text_match",
+                        })
+                results = merged_results
+                logger.info(
+                    "Vector+SQL merge: %s hits total after text fallback",
+                    len(results),
+                )
+            except Exception as e:
+                logger.warning("SQL text-match supplement failed (non-fatal): %s", e)
+
             if not results:
                 result = {
                     "success": False,
@@ -1182,91 +1299,78 @@ Answer directly in a conversational way.{context}"""
                     "_score": r["similarity_score"]
                 })
 
-            def _extract_address_or_location(extracted_data: Any) -> Optional[str]:
-                """Extract first meaningful address/location string from OCR JSON."""
-                if not extracted_data:
-                    return None
-                if isinstance(extracted_data, str):
-                    try:
-                        extracted_data = json.loads(extracted_data)
-                    except Exception:
-                        return None
-                if not isinstance(extracted_data, (dict, list)):
-                    return None
-
-                keys_priority = [
-                    "address", "location", "site_address", "billing_address",
-                    "shipping_address", "vendor_address", "store_address"
-                ]
-                queue: List[Any] = [extracted_data]
-                while queue:
-                    current = queue.pop(0)
-                    if isinstance(current, dict):
-                        lowered = {str(k).lower(): v for k, v in current.items()}
-                        for wanted in keys_priority:
-                            if wanted in lowered and lowered[wanted]:
-                                return str(lowered[wanted])
-                        queue.extend(current.values())
-                    elif isinstance(current, list):
-                        queue.extend(current)
-                return None
-
-            # Enrich with DB data
+            # Enrich with DB data (same DB as DATABASE_URL — not a separate bot_data.db file)
             try:
-                conn = sqlite3.connect("bot_data.db")
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
+                doc_ids = []
+                for r in results:
+                    if r.get("entry_type") == "user_text_entry":
+                        continue
+                    did = r.get("doc_id")
+                    if did is None:
+                        continue
+                    try:
+                        doc_ids.append(int(did))
+                    except (TypeError, ValueError):
+                        continue
+                doc_details = DatabaseService.fetch_documents_for_vector_enrichment(user_id, doc_ids)
 
-                doc_ids = [r["doc_id"] for r in results if r.get("entry_type") != "user_text_entry" and r.get("doc_id") is not None]
-                doc_details = {}
-                if doc_ids:
-                    placeholders = ",".join(["?"] * len(doc_ids))
-                    cursor.execute(f"""
-                        SELECT id, document_type, title, total_amount, vendor_name, created_at, extracted_data
-                        FROM documents
-                        WHERE id IN ({placeholders}) AND user_id = ?
-                    """, (*doc_ids, user_id))
-                    rows = cursor.fetchall()
-                    doc_details = {row["id"]: dict(row) for row in rows}
-
-                text_entry_ids = [r["text_entry_id"] for r in results if r.get("entry_type") == "user_text_entry" and r.get("text_entry_id")]
-                text_entry_details = {}
-                if text_entry_ids:
-                    placeholders = ",".join(["?"] * len(text_entry_ids))
-                    cursor.execute(f"""
-                        SELECT id, text, amount, currency, expense_category, created_at
-                        FROM user_text_entries
-                        WHERE id IN ({placeholders}) AND user_id = ?
-                    """, (*text_entry_ids, user_id))
-                    rows = cursor.fetchall()
-                    text_entry_details = {row["id"]: dict(row) for row in rows}
-                conn.close()
+                text_entry_ids = []
+                for r in results:
+                    if r.get("entry_type") != "user_text_entry":
+                        continue
+                    tid = r.get("text_entry_id")
+                    if tid is None:
+                        continue
+                    try:
+                        text_entry_ids.append(int(tid))
+                    except (TypeError, ValueError):
+                        continue
+                text_entry_details = DatabaseService.fetch_user_text_entries_for_vector_enrichment(
+                    user_id, text_entry_ids
+                )
 
                 for i, item in enumerate(data):
                     result_row = results[i]
                     if result_row.get("entry_type") == "user_text_entry":
                         teid = result_row.get("text_entry_id")
+                        try:
+                            teid = int(teid) if teid is not None else None
+                        except (TypeError, ValueError):
+                            teid = None
                         if teid in text_entry_details:
                             t = text_entry_details[teid]
+                            item["entry_kind"] = "user_text_entry"
                             item["type"] = "user_text_entry"
                             item["title"] = f"Expense Note #{teid}"
                             item["amount"] = t.get("amount")
-                            item["vendor"] = t.get("expense_category")
+                            item["currency"] = t.get("currency")
+                            item["expense_category"] = t.get("expense_category")
                             item["date"] = t.get("created_at")
-                            item["raw_data"] = t.get("text")
+                            item["user_text_body"] = t.get("text")
                         continue
 
                     doc_id = result_row.get("doc_id")
-                    if doc_id in doc_details:
-                        d = doc_details[doc_id]
-                        item.update({k: v for k, v in d.items() if v is not None})
-                        item["type"] = d.get("document_type") or d.get("type") or "document"
-                        item["title"] = d.get("title") or d.get("file_name") or f"Document {doc_id}"
-                        item["amount"] = d.get("total_amount") or d.get("amount")
-                        item["vendor"] = d.get("vendor_name") or d.get("vendor")
-                        item["date"] = d.get("created_at") or d.get("date") or d.get("document_date")
-                        item["raw_data"] = d.get("extracted_data")
-                        item["address"] = _extract_address_or_location(d.get("extracted_data"))
+                    # Normalize id type (Chroma / drivers may vary)
+                    try:
+                        doc_key = int(doc_id) if doc_id is not None else None
+                    except (TypeError, ValueError):
+                        doc_key = None
+                    if doc_key is not None and doc_key in doc_details:
+                        d = doc_details[doc_key]
+                        item["entry_kind"] = "document"
+                        item["id"] = d.get("id")
+                        item["type"] = d.get("document_type") or "document"
+                        item["title"] = d.get("title") or d.get("file_name") or f"Document {doc_key}"
+                        item["amount"] = d.get("total_amount")
+                        item["vendor"] = d.get("vendor_name")
+                        item["date"] = d.get("created_at") or d.get("document_date")
+                        item["extracted_data"] = d.get("extracted_data")
+                    elif doc_key is not None:
+                        logger.warning(
+                            "Vector hit doc_id=%s but no DB row for user_id=%s (re-index Chroma or fix DB)",
+                            doc_key,
+                            user_id,
+                        )
 
             except Exception as e:
                 logger.warning(f"Could not enrich vector results: {e}")
@@ -1284,30 +1388,26 @@ Answer directly in a conversational way.{context}"""
                 data_sorted = sorted(filtered_data, key=lambda x: x.get('_score', 0), reverse=True)
                 filtered_data = data_sorted[:3]
 
-            # Format response using LLM for natural language answer
-            data_summary = json.dumps(filtered_data, indent=2)
+            # LLM sees DB-backed rows only: denormalized columns + full extracted_data JSON (same user_id as query)
+            llm_rows = _rows_for_llm(filtered_data)
+            data_summary = json.dumps(llm_rows, indent=2, default=str)
             row_count = len(filtered_data)
 
-            system_prompt = """You are a friendly expense/document assistant. Answer the user's question based on the document search results.
+            system_prompt = """You are a friendly expense/document assistant.
+
+Answer ONLY using the JSON provided for each hit:
+- For documents: read `extracted_data` (full OCR / extraction JSON from the database). Addresses, amounts, vendor names, line items, etc. all live there unless also duplicated in top-level fields.
+- For user_text_entry rows: use `text`, `amount`, `expense_category`.
 
 Rules:
-1. Answer ONLY what was asked - no extra information
-2. Reply in the SAME language/script as the user's latest message.
-3. Use natural and friendly conversational tone.
-3. Format amounts/currency clearly with ₹ symbol
-4. Keep it brief but complete; 2-4 short lines if user asked for summary
-5. Use at most one relevant emoji (optional)
-5. If `address` or `raw_data` has address/location, prioritize that for location/address questions.
-6. If question asks "kaha", "address", or "location", respond with the exact address found in data.
-
-Example:
-User: "maatha agencies ka kitna bill h"
-Data: [{"vendor_name": "MAATHA AGENCIES", "total_amount": 7222.40}]
-→ "MAATHA AGENCIES ka bill ₹7,222.40 hai 😊" """
+1. Answer only what was asked; match the user's language/script.
+2. Use amounts/currency as they appear in extracted_data or columns.
+3. If extracted_data is missing but extracted_data_raw is present, parse mentally from that string.
+4. Do not invent facts not supported by the provided JSON."""
 
             user_message = f"""Question: "{user_query}"
 
-Documents found ({row_count}):
+Retrieved rows for this user (same scope as user_id in DB); total {row_count}:
 {data_summary}
 
 Give a direct, conversational answer."""
@@ -1316,8 +1416,8 @@ Give a direct, conversational answer."""
                 system_prompt=system_prompt,
                 user_message=user_message,
                 functions=[],
-                temperature=0.7,
-                max_tokens=512
+                temperature=0.5,
+                max_tokens=768
             )
 
             ai_response = llm_result.data.get("content", "") if llm_result.success else "Yeh raha aapka document."
@@ -1334,7 +1434,7 @@ Give a direct, conversational answer."""
                 "row_count": len(filtered_data),
                 "columns": ["type", "title", "amount", "vendor", "date"],
                 "ai_response": ai_response,
-                "fallback": False
+                "fallback": True,
             }
 
             if not hasattr(self, '_search_cache'):

@@ -27,6 +27,8 @@ import openai
 # Import Anthropic for Claude
 import anthropic
 
+from shared.database import DatabaseService
+
 load_dotenv()
 
 logger = logging.getLogger("ocr_service")
@@ -89,6 +91,7 @@ Return a JSON object with these fields:
   "identifiers": {"invoice_number": "string or null", "order_id": "string or null", "gstin": "string or null", "other_ids": []},
   "items": [{"description": "string", "quantity": number_or_null, "price": number_or_null, "amount": number_or_null}],
   "text_content": "string or null - any important text extracted from the document",
+  "expense_category": "string or null - best fit from the allowed list you will be given next",
   "tables": [],
   "confidence": {
     "overall": 0.0_to_1.0,
@@ -111,12 +114,8 @@ Critical fields for confidence assessment:
 
 Adapt the fields based on the document type. For non-financial documents, include relevant fields."""
 
-        self.expense_categories = [
-            "Food and Dining", "Groceries", "Rent", "Utilities", "Fual", "Shopping",
-            "Entertainment", "Healthcare", "Edication", "Personal care", "Subscription",
-            "EMI/Loans", "Insurance", "Investment", "Travel", "Savings", "CAB/Taxi",
-            "Misecellaneous", "Other"
-        ]
+        # Same canonical list as DB / user-text classification (single source of truth)
+        self.expense_categories = DatabaseService.EXPENSE_CATEGORIES
 
     def _build_effective_prompt(
         self,
@@ -133,9 +132,9 @@ Adapt the fields based on the document type. For non-financial documents, includ
         )
         return (
             f"{base_prompt}\n\n"
-            "Also infer a best-fit `expense_category` from this list (if possible):\n"
+            "Also infer a best-fit top-level `expense_category` — must be exactly one string from this list:\n"
             f"{categories_text}\n"
-            "If not inferable, set expense_category to \"Other\"."
+            "Use the same labels as in the app (spelling matters). If not inferable, set expense_category to \"Other\"."
             f"{user_text_section}"
         )
 
