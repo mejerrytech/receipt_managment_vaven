@@ -25,6 +25,13 @@ load_dotenv()
 
 logger = logging.getLogger("nlp_sql_v2")
 
+_nlp_v2_prompt_cache: Dict[str, tuple[str, str]] = {}
+
+
+def invalidate_telegram_q_prompt_cache() -> None:
+    """Clear cached /q prompts (call after admin updates DB)."""
+    _nlp_v2_prompt_cache.clear()
+
 
 def _parse_extracted_json_column(raw: Any) -> Any:
     """Parse documents.extracted_data (JSON text). No field-specific logic."""
@@ -76,65 +83,6 @@ def _rows_for_llm(filtered_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         rows.append(row)
     return rows
 
-
-# Database schema for context
-DB_SCHEMA = """
-Tables:
-
-1. users
-   - id (INTEGER PRIMARY KEY)
-   - telegram_id (BIGINT UNIQUE)
-   - first_name (VARCHAR)
-   - last_name (VARCHAR)
-   - username (VARCHAR)
-   - created_at (DATETIME)
-   - updated_at (DATETIME)
-
-2. documents
-   - id (INTEGER PRIMARY KEY)
-   - user_id (INTEGER FOREIGN KEY -> users.id)
-   - file_name (VARCHAR)
-   - mime_type (VARCHAR)
-   - file_size (INTEGER)
-   - extracted_data (TEXT - JSON)
-   - document_type (VARCHAR)
-   - title (VARCHAR)
-   - document_date (VARCHAR)
-   - total_amount (FLOAT)
-   - currency (VARCHAR)
-   - vendor_name (VARCHAR)
-   - invoice_number (VARCHAR)
-   - gstin (VARCHAR)
-   - confidence_overall (FLOAT)
-   - raw_text (TEXT)
-   - created_at (DATETIME)
-
-3. user_text_entries
-   - id (INTEGER PRIMARY KEY)
-   - user_id (INTEGER FOREIGN KEY -> users.id)
-   - text (TEXT)
-   - intent_tag (VARCHAR)
-   - expense_category (VARCHAR)
-   - amount (FLOAT)
-   - currency (VARCHAR)
-   - created_at (DATETIME)
-
-Key notes:
-- Always filter by user_id for security
-- extracted_data contains full JSON from OCR with ALL details including:
-  * amounts: {total, subtotal, tax, currency}
-  * vendor_or_sender: {name, address, contact}
-  * items: array with {description, quantity, price, amount}
-  * identifiers: {invoice_number, gstin, pan}
-  * Example JSON: {"amounts": {"total": 1749, "subtotal": 1482.76, "tax": 266.24}, "vendor_or_sender": {"name": "Cloudtail India"}}
-- Amazon documents may have vendor names like "Cloudtail India", "Appario Retail", etc. - use LIKE '%amazon%' OR check vendor_name for these sellers
-- For tax rate queries: Calculate as (amounts.tax / amounts.subtotal) * 100 or use json_extract
-- For item-level queries ("kya kya laya", "what items"), return extracted_data as raw_data field and let formatter summarize items
-- document_type examples: invoice, receipt, product_listing, etc.
-- Amounts are in the currency specified (mostly INR)
-- user_text_entries stores manual user expense text (e.g. "Maine room rent 8000 diya").
-  For expense totals/category queries, include this table along with documents when relevant.
-"""
 
 # Function schema for generate_sql function calling
 GENERATE_SQL_FUNCTION = {
@@ -271,6 +219,41 @@ class NLPSQLServiceV2:
 
         logger.info("NLPSQLServiceV2 initialized with orchestration layer")
 
+    @staticmethod
+    def _render_q_user_template(template: Optional[str], **kwargs: Any) -> str:
+        out = template or ""
+        for k, v in kwargs.items():
+            out = out.replace(f"__{k.upper()}__", "" if v is None else str(v))
+        return out
+
+    def _q_tpl_pair(self, key: str) -> tuple[str, str]:
+        if key in _nlp_v2_prompt_cache:
+            return _nlp_v2_prompt_cache[key]
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT system_prompt, user_prompt_template FROM prompts WHERE prompt_key = :k"
+                    ),
+                    {"k": key},
+                ).mappings().first()
+        except Exception as e:
+            logger.error("Failed to load prompt %s: %s", key, e)
+            empty: tuple[str, str] = ("", "")
+            _nlp_v2_prompt_cache[key] = empty
+            return empty
+        if not row:
+            logger.error("Missing DB prompt row for key=%s", key)
+            empty = ("", "")
+            _nlp_v2_prompt_cache[key] = empty
+            return empty
+        sp = row["system_prompt"] or ""
+        raw_upt = row["user_prompt_template"]
+        upt = (raw_upt or "") if raw_upt is not None else ""
+        tup = (sp, upt)
+        _nlp_v2_prompt_cache[key] = tup
+        return tup
+
     def _get_conversation_context(self, user_id: int) -> str:
         """Get formatted conversation history for the user."""
         if user_id not in self.conversation_history:
@@ -377,25 +360,13 @@ class NLPSQLServiceV2:
         Falls back to keyword heuristic if model parsing fails.
         """
         context = self._get_conversation_context(user_id)
-        system_prompt = """You classify whether a user query should be answered using a GLOBAL aggregate expense summary.
-
-Return use_global_summary_sql=true only when user asks for overall totals/snapshot/overview across all (or many) expenses/documents.
-
-Set use_global_summary_sql=false when:
-- user asks about one specific vendor/entity (e.g., "maatha ka summary")
-- user asks item-level/details/doc listing
-- user asks a narrow follow-up referring to one bill/document
-
-Examples:
-- "summary dedo expenses ka" -> true
-- "overall expense overview" -> true
-- "maatha agencies ka summary do" -> false
-- "amazon ka bill kitna tha" -> false
-- "kya kya items laya tha" -> false
-"""
-        user_message = f"""Query: "{user_query}"
-{context}
-Classify routing now."""
+        sys_t, usr_t = self._q_tpl_pair("q_telegram_summary_routing")
+        system_prompt = sys_t
+        user_message = self._render_q_user_template(
+            usr_t,
+            user_query=user_query,
+            context=context,
+        )
 
         try:
             result = self.orchestrator.execute_with_fallback(
@@ -420,34 +391,22 @@ Classify routing now."""
         # Fallback to local heuristic
         return self._is_global_expense_summary_query(user_query)
 
-    def _understand_intent(self, user_query: str) -> Dict[str, Any]:
+    def _understand_intent(self, user_query: str, user_id: int) -> Dict[str, Any]:
         """
         Step 1: Understand user intent using GPT-4o with function calling.
         """
-        system_prompt = """You are an intent classifier for a document management bot.
-
-Analyze the user's query and classify the intent.
-
-Intent Types:
-- "sql_query": User wants specific data from their documents (show invoices, find receipts, totals, etc.)
-- "semantic_search": User asks about content/topics in documents (tell me about AI, what do I have about X, etc.)
-- "conversation": General chat, questions about the bot, help, etc.
-- "greeting": Hello, hi, thanks, bye, etc.
-- "user_info": User asks about their profile, name, settings
-- "unknown": Unclear what user wants
-
-Examples:
-User: "Show my invoices" → sql_query, needs: list of invoice documents, confidence: 0.95
-User: "Tell me about AI" → semantic_search, needs: find documents related to AI topic, confidence: 0.9
-User: "Give me summary of akash enterprises" → semantic_search, needs: find documents about akash enterprises entity, confidence: 0.9
-User: "Total amount across all my receipts" → sql_query, needs: sum of amounts for receipt documents, confidence: 0.9
-User: "Hello" → greeting, needs: greeting response, confidence: 0.99
-
-Use the classify_intent function to provide your classification."""
+        context = self._get_conversation_context(user_id)
+        sys_t, usr_t = self._q_tpl_pair("q_telegram_intent")
+        system_prompt = sys_t
+        user_message = self._render_q_user_template(
+            usr_t,
+            user_query=user_query,
+            context=context,
+        )
 
         result = self.orchestrator.execute_with_fallback(
             system_prompt=system_prompt,
-            user_message=f"Classify this query: {user_query}",
+            user_message=user_message,
             functions=[CLASSIFY_INTENT_FUNCTION],
             temperature=0.1,
             max_tokens=1024
@@ -593,126 +552,17 @@ Classify now."""
         Step 2: Generate SQL using GPT-4o with function calling.
         Falls back to Anthropic if GPT-4o fails.
         """
-        system_prompt = f"""You are an AI assistant that converts natural language questions into safe SQLite SQL queries.
-
-DATABASE SCHEMA:
-{DB_SCHEMA}
-
-========================
-IMPORTANT: CONVERSATION CONTEXT
-========================
-The user may ask follow-up questions with pronouns like "us bill me" (in that bill), "uska GST" (its GST), "kitna tha" (how much was).
-Use the conversation context to resolve these pronouns to specific vendors/entities from previous queries.
-Example:
-- Context: "User: Amazon ka kitna bill tha / Bot: Amazon ka bill ₹1,749 hai"
-- New query: "Gst tha us bill me" → Should query for Amazon documents, not random vendors
-
-========================
-IMPORTANT: AMAZON SELLER NAMES
-========================
-Amazon documents may have vendor names like "Cloudtail India", "Appario Retail", "Cloudtail India Private Limited", etc.
-When user asks about "Amazon", search for these seller names using LIKE with OR conditions.
-Example: vendor_name LIKE '%amazon%' OR vendor_name LIKE '%cloudtail%' OR vendor_name LIKE '%appario%'
-
-========================
-CRITICAL SECURITY RULES:
-========================
-1. ALWAYS include "WHERE user_id = {user_id}" in the query (MANDATORY)
-2. NEVER access data of other users
-3. ONLY generate SELECT queries (NO INSERT, UPDATE, DELETE, DROP, ALTER)
-4. "my" always refers to user_id = {user_id}
-5. Return only valid SQLite SQL
-
-========================
-UI RESPONSE FORMAT RULES (VERY IMPORTANT):
-========================
-The frontend expects these columns ONLY (NO id, NO user_id):
-
-- type (document_type AS type)
-- title
-- amount (total_amount AS amount)
-- vendor (vendor_name AS vendor)
-- date (created_at AS date)
-
-👉 NEVER use SELECT *
-👉 NEVER include id or user_id in SELECT
-👉 ALWAYS explicitly select columns above only
-👉 ALWAYS use aliases exactly as above
-
-Exception:
-- For aggregate/summary queries (total/count/overview/snapshot), return aggregate columns
-  that best answer the question instead of the list columns above.
-
-========================
- COLUMN MAPPING:
-========================
-- document_type → type
-- total_amount → amount
-- vendor_name → vendor
-- created_at → date
-
-========================
- SPECIAL CASES:
-========================
-
-1. If user asks about vendors (e.g., "Who are my vendors?")
-   - Use vendor_name as title
-   - Set type = 'vendor'
-   - Set amount = NULL
-
-2. If query is about totals (SUM, COUNT, etc.)
-   - Return aggregated values with clear aliases
-   - For full expense summary/overview queries (include manual text expenses too), use:
-     SELECT
-       (SELECT COUNT(*) FROM documents WHERE user_id = {user_id}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL) as total_documents,
-       COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL), 0) as total_amount,
-       COUNT(DISTINCT vendor_name) as unique_vendors,
-       (
-         COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL), 0)
-       ) / NULLIF(
-         (SELECT COUNT(*) FROM documents WHERE user_id = {user_id}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL),
-         0
-       ) as avg_amount
-     FROM documents
-     WHERE user_id = {user_id}
-   - Do NOT return a single invoice row for summary/overview asks.
-   - If user asks "summary", "overview", "snapshot", "expenses ka summary",
-     "summary dedo", or "total expenses", ALWAYS return exactly 1 aggregate row.
-   - Never use ORDER BY + LIMIT 1 for summary/overview requests.
-   - Never answer summary/overview requests with vendor-specific single bill queries.
-
-3. If user asks about their profile/details:
-   - Query the users table
-   - Example: SELECT first_name, last_name, username FROM users WHERE id = {user_id}
-
-4. If user asks about ITEMS/PRODUCTS/LINE ITEMS (e.g., "kya kya item laya", "what items", "kaunse products"):
-   - Return the raw extracted_data JSON field - let the response formatter summarize items from it
-   - Use: SELECT extracted_data as raw_data, vendor_name as vendor, title FROM documents WHERE user_id = {user_id} AND vendor_name LIKE '%maatha%'
-   - The raw_data contains an "items" array with objects having: description, quantity, price, amount
-   - Do NOT use json_extract - return the full extracted_data field
-
-5. If user asks about TAX RATE/GST PERCENTAGE (e.g., "kitna % tax h", "GST percentage"):
-   - Extract tax and subtotal from amounts field
-   - Use: json_extract(extracted_data, '$.amounts.tax') as tax, json_extract(extracted_data, '$.amounts.subtotal') as subtotal
-   - Example query for Amazon: SELECT json_extract(extracted_data, '$.amounts.tax') as tax, json_extract(extracted_data, '$.amounts.subtotal') as subtotal, vendor_name as vendor FROM documents WHERE user_id = {user_id} AND (vendor_name LIKE '%amazon%' OR vendor_name LIKE '%cloudtail%' OR vendor_name LIKE '%appario%')
-   - Return: tax, subtotal, vendor
-
-6. If user asks rent-related totals ("room rent kitna", "rent total"):
-   - Include BOTH documents + user_text_entries amounts.
-   - Example:
-     SELECT
-       COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id} AND (LOWER(title) LIKE '%rent%' OR LOWER(vendor_name) LIKE '%rent%' OR LOWER(extracted_data) LIKE '%rent%')), 0) as document_rent_total,
-       COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL AND (LOWER(expense_category) = 'rent' OR LOWER(text) LIKE '%rent%' OR LOWER(text) LIKE '%kiraya%')), 0) as text_rent_total,
-       (
-         COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id} AND (LOWER(title) LIKE '%rent%' OR LOWER(vendor_name) LIKE '%rent%' OR LOWER(extracted_data) LIKE '%rent%')), 0)
-         +
-         COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL AND (LOWER(expense_category) = 'rent' OR LOWER(text) LIKE '%rent%' OR LOWER(text) LIKE '%kiraya%')), 0)
-       ) as total_rent
-
-Use the generate_sql_query function to provide your SQL."""
-
+        schema = self._q_tpl_pair("q_telegram_db_schema")[0]
+        sys_tpl, usr_t = self._q_tpl_pair("q_telegram_generate_sql")
+        system_prompt = (
+            sys_tpl.replace("__DB_SCHEMA__", schema).replace("__USER_ID__", str(user_id))
+        )
         context = self._get_conversation_context(user_id)
-        user_message = f"Convert this query to SQL: {user_query}{context}"
+        user_message = self._render_q_user_template(
+            usr_t,
+            user_query=user_query,
+            context=context,
+        )
         logger.info(f"Query: {user_query}")
         logger.info(f"Context length: {len(context)} chars")
         logger.info(f"Context preview: {context[:500] if context else 'None'}")
@@ -847,18 +697,13 @@ Use the generate_sql_query function to provide your SQL."""
             intent_hint = "The user is having a general conversation."
             default_reply = "Bilkul! Aap natural language me pucho, main documents se sahi answer nikal dunga 😊"
 
-        system_prompt = """You are a friendly document and expense assistant.
-
-Rules:
-1. Reply in the SAME language/script as the user's latest message.
-2. Keep tone warm, natural, and concise.
-3. Add 1 relevant emoji only when it feels natural.
-4. Do not mention SQL, database, models, or technical internals.
-5. If user seems unsure, include one helpful example query."""
-
-        user_message = f"""{intent_hint}
-User message: {user_query}
-Generate one short assistant reply."""
+        sys_t, usr_t = self._q_tpl_pair("q_telegram_social_reply")
+        system_prompt = sys_t
+        user_message = self._render_q_user_template(
+            usr_t,
+            intent_hint=intent_hint,
+            user_query=user_query,
+        )
 
         result = self.orchestrator.execute_with_fallback(
             system_prompt=system_prompt,
@@ -925,7 +770,7 @@ Generate one short assistant reply."""
                 }
 
         # Step 1: Intent Classification
-        intent_analysis = self._understand_intent(user_query)
+        intent_analysis = self._understand_intent(user_query, user_id)
         logger.info(f"Intent analysis for '{user_query}': {intent_analysis}")
 
         intent = intent_analysis.get("intent", "unknown")
@@ -1074,63 +919,21 @@ Generate one short assistant reply."""
         is_list_request = any(token in q for token in ["list", "all", "saare", "sabhi", "vendors", "vendor", "sellers"])
         formatter_limit = 100 if is_list_request else 20
         formatter_rows = data[:formatter_limit]
-        data_summary = json.dumps(formatter_rows, indent=2) if data else "[]"
+        data_summary = (
+            json.dumps(formatter_rows, indent=2, default=str) if data else "[]"
+        )
         row_count = len(data)
 
-        system_prompt = """You are a friendly expense/document assistant. Answer the user's question based on the query results.
-
-Rules:
-1. Answer ONLY what was asked - no extra information
-2. Reply in the SAME language/script as the user's latest message.
-3. Use natural, friendly conversational tone.
-3. Format amounts/currency clearly with ₹ symbol
-4. Do not mention SQL, database, or technical details
-5. Keep it brief but complete - 2-5 short lines are okay when summary is needed
-6. If user explicitly asks to list/show all vendors/items/rows, include all relevant rows from provided data.
-   Do not silently reduce to top 5.
-7. IMPORTANT: If data contains "raw_data" field with JSON, parse it to extract items, amounts, vendor details etc.
-   - raw_data.items[] has objects with: description, quantity, price, amount
-   - Summarize items as: "Item Name (qty)" format
-   - Example: [{"description":"Cement","quantity":5}] → "Cement (5 qty)"
-8. For totals/tax/GST questions, use clear friendly breakdown with bullets when multiple parts exist.
-9. Use at most one relevant emoji where useful. Avoid over-decorating.
-
-Examples:
-User: "maatha agencies ka kitna bill h"
-Data: [{"vendor_name": "MAATHA AGENCIES", "total_amount": 7222.40}]
-→ "MAATHA AGENCIES ka bill ₹7,222.40 hai"
-
-User: "show my invoices"
-Data: [{"document_type": "invoice", "vendor_name": "ABC Corp"}]
-→ "Aapke paas ABC Corp se invoice hai"
-
-User: "kya kya item laya tha maatha agencies se"
-Data: [{"raw_data": "{\"items\":[{\"description\":\"2x2 Single M. C. Ply\",\"quantity\":266,\"price\":1.75,\"amount\":113}]}", "vendor": "MAATHA AGENCIES"}]
-→ "Maatha Agencies se 2x2 Single M. C. Ply (266 qty) laya tha"
-
-User: "kya kya item laya tha" (generic, no vendor specified)
-Data: [{"raw_data": "{\"items\":[{\"description\":\"Cement 50kg\",\"quantity\":5,\"price\":350,\"amount\":1750}]}", "vendor": "MAATHA"}, {"raw_data": "{\"items\":[{\"description\":\"Steel rods\",\"quantity\":10,\"price\":1200,\"amount\":12000}]}", "vendor": "ABC Corp"}]
-→ "Cement 50kg (5 qty - Maatha Agencies) aur Steel rods (10 qty - ABC Corp) laya tha"
-
-User: "kitna % tax h"
-Data: [{"tax": "266.24", "subtotal": "1482.76", "vendor": "Cloudtail India"}]
-→ "Tax rate 18% hai (₹266.24 tax on ₹1482.76 subtotal)."
-
-User: "ab total GST kitna tha"
-Data: [{"vendor":"Laptop","tax":4800},{"vendor":"Dana Pani","tax":1441.44}]
-→ "Aapka total GST ₹6,241.44 hai.\n• Laptop: ₹4,800\n• Dana Pani: ₹1,441.44"
-
-User: "summary dedo expenses ka"
-Data: [{"total_documents":4,"total_amount":13695.64,"unique_vendors":4,"avg_amount":3423.91}]
-→ "Aapke 4 expenses ka total ₹13,695.64 hai. Average ₹3,423.91 per expense hai, aur 4 unique vendors hain." """
-
+        sys_t, usr_t = self._q_tpl_pair("q_telegram_format_sql_response")
+        system_prompt = sys_t
         context = self._get_conversation_context(user_id)
-        user_message = f"""Question: "{user_query}"
-
-Data found ({row_count} rows):
-{data_summary}
-
-Answer directly in a conversational way.{context}"""
+        user_message = self._render_q_user_template(
+            usr_t,
+            user_query=user_query,
+            row_count=str(row_count),
+            data_summary=data_summary,
+            context=context,
+        )
 
         result = self.orchestrator.execute_with_fallback(
             system_prompt=system_prompt,
@@ -1393,24 +1196,16 @@ Answer directly in a conversational way.{context}"""
             data_summary = json.dumps(llm_rows, indent=2, default=str)
             row_count = len(filtered_data)
 
-            system_prompt = """You are a friendly expense/document assistant.
-
-Answer ONLY using the JSON provided for each hit:
-- For documents: read `extracted_data` (full OCR / extraction JSON from the database). Addresses, amounts, vendor names, line items, etc. all live there unless also duplicated in top-level fields.
-- For user_text_entry rows: use `text`, `amount`, `expense_category`.
-
-Rules:
-1. Answer only what was asked; match the user's language/script.
-2. Use amounts/currency as they appear in extracted_data or columns.
-3. If extracted_data is missing but extracted_data_raw is present, parse mentally from that string.
-4. Do not invent facts not supported by the provided JSON."""
-
-            user_message = f"""Question: "{user_query}"
-
-Retrieved rows for this user (same scope as user_id in DB); total {row_count}:
-{data_summary}
-
-Give a direct, conversational answer."""
+            sys_t, usr_t = self._q_tpl_pair("q_telegram_vector_semantic")
+            system_prompt = sys_t
+            hist = self._get_conversation_context(user_id)
+            user_message = self._render_q_user_template(
+                usr_t,
+                user_query=user_query,
+                data_summary=data_summary,
+                row_count=str(row_count),
+                context=hist,
+            )
 
             llm_result = self.orchestrator.execute_with_fallback(
                 system_prompt=system_prompt,

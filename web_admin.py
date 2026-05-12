@@ -141,6 +141,42 @@ def get_stats():
         }
 
 
+class TelegramPromptUpdate(BaseModel):
+    system_prompt: str
+    user_prompt_template: Optional[str] = None
+
+
+@app.get("/api/prompts")
+def api_list_prompts(category: str = "telegram_q"):
+    """List LLM prompts from the shared app database (same DATABASE_URL as the bot)."""
+    return DatabaseService.list_prompts(category=category)
+
+
+@app.put("/api/prompts/{prompt_key}")
+def api_update_prompt(prompt_key: str, body: TelegramPromptUpdate):
+    """Update a prompt row; clears NLP v2 in-memory prompt cache."""
+    ok = DatabaseService.update_prompt_by_key(
+        prompt_key,
+        body.system_prompt,
+        body.user_prompt_template,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Unknown prompt_key")
+    return {"ok": True, "prompt_key": prompt_key}
+
+
+@app.get("/telegram-q-prompts", response_class=HTMLResponse)
+def telegram_q_prompts_admin_page():
+    """Dedicated admin UI for Telegram /q prompts (loads from DB)."""
+    tpl = Path(__file__).resolve().parent / "telegram_q_prompts_admin.html"
+    if not tpl.is_file():
+        return HTMLResponse(
+            "<h1>Missing telegram_q_prompts_admin.html next to web_admin.py</h1>",
+            status_code=500,
+        )
+    return HTMLResponse(tpl.read_text(encoding="utf-8"))
+
+
 # ============== AI CHAT & USER SESSION ENDPOINTS ==============
 
 class ChatRequest(BaseModel):
@@ -881,6 +917,7 @@ def dashboard(request: Request):
             <div>
                 <h1>📊 Bot Admin Panel</h1>
                 <p>AI-Powered Document Intelligence</p>
+                <p style="margin-top:0.5rem;font-size:0.9rem"><a href="/telegram-q-prompts" style="color:#fff;text-decoration:underline">Telegram /q prompts (DB)</a></p>
             </div>
             <div class="user-selector">
                 <div id="current-user-display" class="current-user-badge" style="display: none;">

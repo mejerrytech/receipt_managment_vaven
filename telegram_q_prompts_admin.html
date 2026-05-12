@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Telegram /q prompts</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+    body { margin: 0; padding: 1.5rem; max-width: 1200px; margin-inline: auto; }
+    h1 { font-size: 1.35rem; margin-bottom: 0.25rem; }
+    p.meta { color: #94a3b8; font-size: 0.875rem; margin-bottom: 1.25rem; }
+    a { color: #38bdf8; }
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+      margin-bottom: 1.25rem;
+    }
+    .card h2 { font-size: 0.95rem; color: #f8fafc; margin: 0 0 0.35rem; }
+    .key { font-family: ui-monospace, monospace; font-size: 0.8rem; color: #a5b4fc; }
+    label { display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: #94a3b8; margin: 0.6rem 0 0.25rem; }
+    textarea {
+      width: 100%;
+      min-height: 140px;
+      background: #0f172a;
+      color: #e2e8f0;
+      border: 1px solid #475569;
+      border-radius: 6px;
+      padding: 0.6rem;
+      font-size: 0.85rem;
+      font-family: ui-monospace, monospace;
+      box-sizing: border-box;
+    }
+    textarea.user-tpl { min-height: 72px; }
+    .actions { margin-top: 0.65rem; display: flex; gap: 0.5rem; align-items: center; }
+    button {
+      background: #6366f1;
+      color: white;
+      border: none;
+      padding: 0.45rem 1rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.85rem;
+    }
+    button:hover { background: #4f46e5; }
+    .status { font-size: 0.8rem; color: #94a3b8; }
+    .status.ok { color: #4ade80; }
+    .status.err { color: #f87171; }
+    .hint { font-size: 0.75rem; color: #64748b; margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <h1>Telegram <code>/q</code> prompts</h1>
+  <p class="meta">Loaded from the <code>prompts</code> table (<code>DATABASE_URL</code>). Edit and save; the bot picks up changes on the next request (in-process cache cleared after save). <a href="/">← Admin home</a></p>
+  <p class="hint" style="margin-bottom:1rem">Placeholders — user templates: <code>__USER_QUERY__</code>, <code>__CONTEXT__</code>, <code>__ROW_COUNT__</code>, <code>__DATA_SUMMARY__</code>, <code>__INTENT_HINT__</code>. SQL system: <code>__DB_SCHEMA__</code>, <code>__USER_ID__</code>.</p>
+  <p class="status" id="global-status"></p>
+  <div id="list"></div>
+
+  <script>
+    async function loadPrompts() {
+      const el = document.getElementById("global-status");
+      el.textContent = "Loading…";
+      el.className = "status";
+      try {
+        const r = await fetch("/api/prompts?category=telegram_q");
+        if (!r.ok) throw new Error(await r.text());
+        const rows = await r.json();
+        el.textContent = rows.length + " prompt(s) loaded.";
+        el.className = "status ok";
+        const root = document.getElementById("list");
+        root.innerHTML = "";
+        rows.forEach((row) => {
+          const k = row.prompt_key;
+          const card = document.createElement("div");
+          card.className = "card";
+          const usr = row.user_prompt_template == null ? "" : row.user_prompt_template;
+          card.innerHTML =
+            "<h2>" + escapeHtml(row.label) + "</h2>" +
+            "<div class=\"key\">" + escapeHtml(k) + "</div>" +
+            "<label>system_prompt</label>" +
+            "<textarea id=\"sys_" + k + "\"></textarea>" +
+            "<label>user_prompt_template (optional)</label>" +
+            "<textarea class=\"user-tpl\" id=\"usr_" + k + "\"></textarea>" +
+            "<div class=\"actions\">" +
+            "<button type=\"button\" data-key=\"" + escapeAttr(k) + "\">Save</button>" +
+            "<span class=\"status\" id=\"st_" + k + "\"></span></div>";
+          root.appendChild(card);
+          document.getElementById("sys_" + k).value = row.system_prompt || "";
+          document.getElementById("usr_" + k).value = usr;
+          card.querySelector("button").onclick = () => savePrompt(k);
+        });
+      } catch (e) {
+        el.textContent = "Error: " + e.message;
+        el.className = "status err";
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+    function escapeAttr(s) {
+      return String(s).replace(/"/g, "&quot;");
+    }
+
+    async function savePrompt(promptKey) {
+      const st = document.getElementById("st_" + promptKey);
+      st.textContent = "Saving…";
+      st.className = "status";
+      const body = {
+        system_prompt: document.getElementById("sys_" + promptKey).value,
+        user_prompt_template: document.getElementById("usr_" + promptKey).value || null,
+      };
+      try {
+        const r = await fetch("/api/prompts/" + encodeURIComponent(promptKey), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        st.textContent = "Saved.";
+        st.className = "status ok";
+      } catch (e) {
+        st.textContent = "Error: " + e.message;
+        st.className = "status err";
+      }
+    }
+
+    loadPrompts();
+  </script>
+</body>
+</html>

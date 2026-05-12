@@ -4,7 +4,7 @@ import logging
 import secrets
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
@@ -256,6 +256,21 @@ class UserTextEntry(Base):
         }
 
 
+class BotPrompt(Base):
+    """Editable LLM prompts (e.g. Telegram /q pipeline)."""
+
+    __tablename__ = "prompts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    prompt_key = Column(String(120), unique=True, nullable=False, index=True)
+    label = Column(String(255), nullable=False)
+    category = Column(String(64), nullable=False, default="telegram_q")
+    system_prompt = Column(Text, nullable=False, default="")
+    user_prompt_template = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 def init_db():
     """Initialize database - create all tables."""
     Base.metadata.create_all(bind=engine)
@@ -264,6 +279,7 @@ def init_db():
     _ensure_expense_category_columns()
     _ensure_user_input_text_columns()
     _ensure_user_text_entry_amount_columns()
+    _seed_telegram_q_prompts()
     logger.info("Database initialized successfully")
 
 
@@ -337,6 +353,48 @@ def _ensure_user_text_entry_amount_columns():
         if "currency" not in cols:
             conn.execute(text("ALTER TABLE user_text_entries ADD COLUMN currency VARCHAR(10)"))
         conn.commit()
+
+
+def _seed_telegram_q_prompts() -> None:
+    """Insert default Telegram /q prompts if missing (idempotent)."""
+    try:
+        from shared.telegram_q_prompt_seed import load_telegram_q_seed_rows
+    except ImportError:
+        logger.warning("telegram_q_prompt_seed not available; skipping prompt seed")
+        return
+    rows = load_telegram_q_seed_rows()
+    if not rows:
+        logger.warning("No telegram_q seed rows; skipping prompt seed")
+        return
+    try:
+        with engine.begin() as conn:
+            for r in rows:
+                pk = r.get("prompt_key")
+                if not pk:
+                    continue
+                exists = conn.execute(
+                    text("SELECT 1 FROM prompts WHERE prompt_key = :k"), {"k": pk}
+                ).scalar()
+                if exists:
+                    continue
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO prompts (prompt_key, label, category, system_prompt, user_prompt_template)
+                        VALUES (:prompt_key, :label, :category, :system_prompt, :user_prompt_template)
+                        """
+                    ),
+                    {
+                        "prompt_key": pk,
+                        "label": r.get("label") or pk,
+                        "category": r.get("category") or "telegram_q",
+                        "system_prompt": r.get("system_prompt") or "",
+                        "user_prompt_template": r.get("user_prompt_template"),
+                    },
+                )
+        logger.info("Telegram /q prompts seed checked (%s definitions)", len(rows))
+    except Exception as e:
+        logger.warning("Prompt seed skipped or failed: %s", e)
 
 
 def get_db():
@@ -1386,6 +1444,67 @@ class DatabaseService:
             raise
         finally:
             db.close()
+
+    @staticmethod
+    def list_prompts(category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return prompt rows for admin UI (optionally filter by category)."""
+        with engine.connect() as conn:
+            if category:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT id, prompt_key, label, category, system_prompt, user_prompt_template,
+                               created_at, updated_at
+                        FROM prompts WHERE category = :c ORDER BY prompt_key
+                        """
+                    ),
+                    {"c": category},
+                ).mappings().all()
+            else:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT id, prompt_key, label, category, system_prompt, user_prompt_template,
+                               created_at, updated_at
+                        FROM prompts ORDER BY category, prompt_key
+                        """
+                    )
+                ).mappings().all()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            for key in ("created_at", "updated_at"):
+                v = d.get(key)
+                if v is not None and hasattr(v, "isoformat"):
+                    d[key] = v.isoformat()
+            out.append(d)
+        return out
+
+    @staticmethod
+    def update_prompt_by_key(
+        prompt_key: str, system_prompt: str, user_prompt_template: Optional[str] = None
+    ) -> bool:
+        """Persist prompt edits and invalidate in-process NLP prompt cache."""
+        ts = datetime.now(timezone.utc)
+        with engine.begin() as conn:
+            res = conn.execute(
+                text(
+                    """
+                    UPDATE prompts
+                    SET system_prompt = :sp, user_prompt_template = :upt, updated_at = :ts
+                    WHERE prompt_key = :pk
+                    """
+                ),
+                {"sp": system_prompt or "", "upt": user_prompt_template, "ts": ts, "pk": prompt_key},
+            )
+            changed = getattr(res, "rowcount", None) or 0
+        try:
+            from shared.nlp_sql_service_v2 import invalidate_telegram_q_prompt_cache
+
+            invalidate_telegram_q_prompt_cache()
+        except Exception:
+            pass
+        return bool(changed)
 
 
 # Initialize database on module import
