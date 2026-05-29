@@ -7,7 +7,6 @@ This version uses the orchestrator to:
 - Use function calling for structured outputs
 """
 
-import os
 import json
 import logging
 import re
@@ -84,6 +83,26 @@ def _rows_for_llm(filtered_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _documents_to_formatter_rows(documents: List[Any]) -> List[Dict[str, Any]]:
+    """Convert Document ORM rows into formatter-ready rows with full OCR JSON."""
+    rows: List[Dict[str, Any]] = []
+    for doc in documents:
+        raw_data = getattr(doc, "extracted_data", None)
+        row: Dict[str, Any] = {
+            "type": getattr(doc, "document_type", None) or "document",
+            "title": getattr(doc, "title", None) or getattr(doc, "file_name", None),
+            "amount": getattr(doc, "total_amount", None),
+            "vendor": getattr(doc, "vendor_name", None),
+            "date": getattr(doc, "document_date", None) or getattr(doc, "created_at", None),
+            "raw_data": raw_data,
+        }
+        parsed = _parse_extracted_json_column(raw_data)
+        if parsed is not None:
+            row["extracted_data"] = parsed
+        rows.append(row)
+    return rows
+
+
 # Function schema for generate_sql function calling
 GENERATE_SQL_FUNCTION = {
     "name": "generate_sql_query",
@@ -93,7 +112,7 @@ GENERATE_SQL_FUNCTION = {
         "properties": {
             "sql": {
                 "type": "string",
-                "description": "The SQLite SQL query. Must include WHERE user_id filter."
+                "description": "The PostgreSQL SQL query. Must include WHERE user_id filter."
             },
             "explanation": {
                 "type": "string",
@@ -195,6 +214,74 @@ CLASSIFY_STORAGE_DECISION_FUNCTION = {
     }
 }
 
+# Function schema for resolving follow-up questions using conversation context
+RESOLVE_QUERY_WITH_CONTEXT_FUNCTION = {
+    "name": "resolve_query_with_context",
+    "description": (
+        "Rewrite a user question into a self-contained data question using only the "
+        "current message and prior conversation context"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "should_use_resolved_query": {
+                "type": "boolean",
+                "description": "True when the current question depends on prior context or needs spelling/entity normalization",
+            },
+            "resolved_query": {
+                "type": "string",
+                "description": "Self-contained question preserving the user's intent and language",
+            },
+            "focus": {
+                "type": "string",
+                "description": "Short natural-language focus instruction for the answer formatter",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Brief explanation of what was resolved",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence between 0 and 1",
+            },
+        },
+        "required": [
+            "should_use_resolved_query",
+            "resolved_query",
+            "focus",
+            "reason",
+            "confidence",
+        ],
+    },
+}
+
+# Function schema for identity / "who am I" routing under user_info intent
+CLASSIFY_IDENTITY_PROFILE_FUNCTION = {
+    "name": "classify_identity_profile",
+    "description": "Decide if the user asks about their own name or Telegram profile identity",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "is_identity_profile_query": {
+                "type": "boolean",
+                "description": (
+                    "True when user asks who they are, their name, or Telegram profile name "
+                    "(e.g. who am I, mera naam, kaun hu)"
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "Short reason for the decision",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence between 0 and 1",
+            },
+        },
+        "required": ["is_identity_profile_query", "reason", "confidence"],
+    },
+}
+
 
 class NLPSQLServiceV2:
     """
@@ -203,7 +290,7 @@ class NLPSQLServiceV2:
     Architecture:
     1. Intent Classification (GPT-4o with function calling)
     2. SQL Generation (GPT-4o with function calling) -> Anthropic fallback
-    3. Query Execution (SQLite)
+    3. Query Execution (PostgreSQL)
     4. Response Formatting (GPT-4o)
     """
 
@@ -258,8 +345,21 @@ class NLPSQLServiceV2:
         """Get formatted conversation history for the user."""
         if user_id not in self.conversation_history:
             return ""
-        
+
         history = self.conversation_history[user_id]
+        if isinstance(history, dict):
+            logger.warning("Repairing malformed conversation history for user %s", user_id)
+            history = [history] if history.get("query") or history.get("response") else []
+            self.conversation_history[user_id] = history
+        elif not isinstance(history, list):
+            logger.warning(
+                "Resetting unsupported conversation history type for user %s: %s",
+                user_id,
+                type(history).__name__,
+            )
+            history = []
+            self.conversation_history[user_id] = history
+
         if not history:
             return ""
         
@@ -286,19 +386,31 @@ class NLPSQLServiceV2:
 
     def _add_to_history(self, user_id: int, query: str, response: str):
         """Add interaction to conversation history, keeping only last 10."""
-        if user_id not in self.conversation_history:
+        history = self.conversation_history.get(user_id)
+        if isinstance(history, dict):
+            logger.warning("Repairing malformed conversation history before append for user %s", user_id)
+            history = [history] if history.get("query") or history.get("response") else []
+        elif not isinstance(history, list):
+            if history is not None:
+                logger.warning(
+                    "Resetting unsupported conversation history before append for user %s: %s",
+                    user_id,
+                    type(history).__name__,
+                )
+            history = []
             self.conversation_history[user_id] = []
-        
-        self.conversation_history[user_id].append({
+
+        history.append({
             "query": query,
             "response": response
         })
-        
-        logger.info(f"Added to history for user {user_id}: query='{query[:50]}...', total entries={len(self.conversation_history[user_id])}")
-        
+
+        self.conversation_history[user_id] = history
+        logger.info(f"Added to history for user {user_id}: query='{query[:50]}...', total entries={len(history)}")
+
         # Keep only last 10
-        if len(self.conversation_history[user_id]) > self.MAX_HISTORY:
-            self.conversation_history[user_id] = self.conversation_history[user_id][-self.MAX_HISTORY]
+        if len(history) > self.MAX_HISTORY:
+            self.conversation_history[user_id] = history[-self.MAX_HISTORY:]
 
     def clear_user_history(self, user_id: int) -> None:
         """Clear conversation history for a specific user."""
@@ -306,25 +418,83 @@ class NLPSQLServiceV2:
             del self.conversation_history[user_id]
             logger.info(f"Cleared NLP SQL conversation history for user {user_id}")
 
-    def _is_global_expense_summary_query(self, user_query: str) -> bool:
-        """Detect broad summary/overview asks that should always use aggregate SQL."""
-        q = (user_query or "").strip().lower()
-        if not q:
-            return False
+    def _resolve_query_with_context(self, user_query: str, user_id: int) -> Dict[str, Any]:
+        """Resolve follow-ups through the model instead of local keyword rules."""
+        text_query = (user_query or "").strip()
+        empty = {
+            "effective_query": text_query,
+            "focus": "",
+            "reason": "",
+            "confidence": 0.0,
+            "resolved": False,
+        }
+        if not text_query:
+            return empty
 
-        summary_terms = [
-            "summary", "overview", "snapshot", "total expenses", "expense summary",
-            "expenses ka summary", "summary dedo", "summarize", "overall"
-        ]
-        hindi_summary_terms = [
-            "kharcha", "kharche", "expense", "expenses", "total", "saare", "sabhi"
-        ]
-        has_summary_intent = any(term in q for term in summary_terms)
-        has_expense_hint = any(term in q for term in hindi_summary_terms)
+        context = self._get_conversation_context(user_id)
+        if not context.strip():
+            return empty
 
-        # Also catch short asks like: "summary dedo expenses ka"
-        regex_match = re.search(r"(summary|overview|snapshot).*(expense|expenses|kharch|kharc|total)", q)
-        return bool((has_summary_intent and has_expense_hint) or regex_match)
+        system_prompt = """You resolve short, misspelled, or follow-up user questions for a receipt/expense assistant.
+
+Use ONLY the current user message and the previous conversation context. Do not invent vendors, items, prices, categories, or documents.
+
+Your job:
+1. If the latest question is already self-contained, keep it unchanged.
+2. If it refers to something from context, rewrite it into a self-contained question.
+3. Preserve the user's language/script and intent.
+4. Normalize spelling only when the context clearly supports it. Common Hinglish typos like "merta" should usually mean "mera" (my), not a place/vendor/entity, unless context explicitly established Merta as a saved entity.
+5. For item questions, keep the requested item, quantity/unit-price/total-price distinction, and target document/vendor if known.
+6. For vendor/entity questions, do not assume aliases unless the context already established that relationship.
+7. For location follow-ups like "sirf Lucknow se", "or Delhi se", preserve the previous item/category (for example petrol/fuel) and add the requested city/location as a hard filter.
+8. If the latest question is "kaise", "kese", "how", "breakdown", or asks why/how a previous total was calculated, rewrite it as a breakdown/explanation of the immediately previous total using the same category/entity from context.
+9. If the previous context is a saved manual expense ("Saved as Travel/Shopping/etc expense"), follow-up questions like "kaha gya tha me", "flight se kaha gya", "kya kya liya", or "kb liya" should resolve to the saved manual expense text and category, not the user's Telegram profile.
+10. Prefer the immediately previous expense/category answer over older receipt/document matches when resolving short follow-ups.
+11. Return a short focus instruction that the final answer can use to avoid unrelated rows.
+
+Call resolve_query_with_context only."""
+        user_message = f"""Latest user question:
+\"\"\"{text_query}\"\"\"
+
+Conversation context:
+{context}
+
+Resolve now."""
+
+        try:
+            result = self.orchestrator.execute_with_fallback(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                functions=[RESOLVE_QUERY_WITH_CONTEXT_FUNCTION],
+                temperature=0.1,
+                max_tokens=500,
+            )
+            if result.success and result.function_calls:
+                func_call = result.function_calls[0]
+                args = func_call.get("arguments", {})
+                if isinstance(args, str):
+                    args = json.loads(args)
+                confidence = float(args.get("confidence", 0.0) or 0.0)
+                resolved_query = (args.get("resolved_query") or text_query).strip()
+                should_resolve = bool(args.get("should_use_resolved_query", False))
+                if should_resolve and resolved_query and confidence >= 0.55:
+                    return {
+                        "effective_query": resolved_query,
+                        "focus": (args.get("focus") or "").strip(),
+                        "reason": (args.get("reason") or "").strip(),
+                        "confidence": confidence,
+                        "resolved": True,
+                    }
+                return {
+                    **empty,
+                    "focus": (args.get("focus") or "").strip(),
+                    "reason": (args.get("reason") or "").strip(),
+                    "confidence": confidence,
+                }
+        except Exception as e:
+            logger.warning("Context query resolver failed; using original query: %s", e)
+
+        return empty
 
     def _build_global_summary_sql(self, user_id: int) -> str:
         """Return canonical aggregate SQL for global expense summary requests."""
@@ -339,29 +509,18 @@ class NLPSQLServiceV2:
     0
   ) as avg_amount"""
 
-    def _is_rent_query(self, user_query: str) -> bool:
-        q = (user_query or "").lower()
-        return any(k in q for k in ["rent", "room rent", "house rent", "kiraya"])
-
-    def _build_rent_total_sql(self, user_id: int) -> str:
-        """Rent total across OCR documents + manual user text entries."""
-        return f"""SELECT
-  COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id} AND (LOWER(title) LIKE '%rent%' OR LOWER(vendor_name) LIKE '%rent%' OR LOWER(extracted_data) LIKE '%rent%')), 0) as document_rent_total,
-  COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL AND (LOWER(expense_category) = 'rent' OR LOWER(text) LIKE '%rent%' OR LOWER(text) LIKE '%kiraya%')), 0) as text_rent_total,
-  (
-    COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id} AND (LOWER(title) LIKE '%rent%' OR LOWER(vendor_name) LIKE '%rent%' OR LOWER(extracted_data) LIKE '%rent%')), 0)
-    +
-    COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL AND (LOWER(expense_category) = 'rent' OR LOWER(text) LIKE '%rent%' OR LOWER(text) LIKE '%kiraya%')), 0)
-  ) as total_rent"""
-
     def _should_use_global_summary_sql(self, user_query: str, user_id: int) -> bool:
         """
         Dynamically decide summary routing via prompt+function-calling.
-        Falls back to keyword heuristic if model parsing fails.
+        If the model is unavailable, keep the normal hybrid path.
         """
         context = self._get_conversation_context(user_id)
         sys_t, usr_t = self._q_tpl_pair("q_telegram_summary_routing")
-        system_prompt = sys_t
+        system_prompt = sys_t + """
+
+Runtime rule:
+- Return true only for broad overall expense totals/overview.
+- Return false for category breakdowns/counts/rankings, item questions, vendor-specific questions, or follow-ups about one bill/document."""
         user_message = self._render_q_user_template(
             usr_t,
             user_query=user_query,
@@ -386,10 +545,46 @@ class NLPSQLServiceV2:
                 if confidence >= 0.60:
                     return decision
         except Exception as e:
-            logger.warning(f"Summary routing classifier failed; using heuristic fallback: {e}")
+            logger.warning("Summary routing classifier failed; using hybrid path: %s", e)
 
-        # Fallback to local heuristic
-        return self._is_global_expense_summary_query(user_query)
+        return False
+
+    def _is_identity_profile_query(self, user_query: str, user_id: int) -> bool:
+        """Decide identity/name asks via DB prompt."""
+        q = (user_query or "").strip()
+        if not q:
+            return False
+
+        context = self._get_conversation_context(user_id)
+        sys_t, usr_t = self._q_tpl_pair("q_telegram_identity_profile")
+        system_prompt = sys_t
+        user_message = self._render_q_user_template(
+            usr_t,
+            user_query=user_query,
+            context=context,
+        )
+
+        try:
+            result = self.orchestrator.execute_with_fallback(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                functions=[CLASSIFY_IDENTITY_PROFILE_FUNCTION],
+                temperature=0.1,
+                max_tokens=300,
+            )
+            if result.success and result.function_calls:
+                func_call = result.function_calls[0]
+                args = func_call["arguments"]
+                if isinstance(args, str):
+                    args = json.loads(args)
+                decision = bool(args.get("is_identity_profile_query", False))
+                confidence = float(args.get("confidence", 0.0) or 0.0)
+                if confidence >= 0.60:
+                    return decision
+        except Exception as e:
+            logger.warning("Identity profile classifier failed; using default route: %s", e)
+
+        return False
 
     def _understand_intent(self, user_query: str, user_id: int) -> Dict[str, Any]:
         """
@@ -557,6 +752,23 @@ Classify now."""
         system_prompt = (
             sys_tpl.replace("__DB_SCHEMA__", schema).replace("__USER_ID__", str(user_id))
         )
+        system_prompt += f"""
+
+Runtime grounding rules:
+- Prefer the latest resolved question and conversation context over isolated word matches.
+- For item, product, quantity, unit-price, or line-item questions, include documents.extracted_data as raw_data plus vendor/title/amount/date so the formatter can inspect nested OCR JSON.
+- For category breakdowns, category counts, or "highest expense by category" style questions, aggregate documents.expense_category and user_text_entries.expense_category together when relevant.
+- For "kaise/how/breakdown" follow-ups after a total, return the contributing rows (title/text, amount, category, date) instead of another total-only aggregate.
+- For manual expense follow-ups ("kya kya liya", "kb liya", "kaha gya", "flight se kaha") return user_text_entries.text, amount, expense_category, created_at so the formatter can infer details from the saved text.
+- For category totals like shopping/travel, include user_text_entries and documents only when the saved category matches. Do not use unrelated receipt items just because they are in conversation history.
+- Location/city words such as Lucknow, Delhi/Dehli, Jaipur, Mumbai, etc. are hard filters. For these, search documents.vendor_name, documents.title, documents.raw_text, and documents.extracted_data for the location while also preserving the requested item/category from context.
+- If no row supports the requested location/entity, return zero rows rather than reusing a previous or semantically similar row.
+- For petrol/fuel questions, do not require the literal word "petrol" in OCR items. Fuel-station evidence includes documents.expense_category = 'Fuel', vendor/title/raw_text/extracted_data containing fuel, fuels, petrol, diesel, oil, IndianOil, IOCL, HPCL, BPCL, pump, or filling station.
+- For petrol/fuel amount questions, return the receipt total_amount/amount for matching fuel receipts. If a location is requested, apply BOTH the fuel evidence and the location evidence in the WHERE clause.
+- For named vendor/entity questions, constrain results to rows whose saved fields or extracted OCR JSON support that entity. Do not assume aliases or marketplace relationships unless the query/context explicitly states them.
+- If the vendor/entity phrase appears misspelled or contains a generic business type, search saved fields and extracted OCR JSON using the distinctive part(s) of the phrase rather than requiring the entire phrase to match exactly.
+- If exact structured SQL is uncertain, return rows with raw_data instead of collapsing to total_amount only.
+- Keep every query scoped to user_id = {user_id} and SELECT-only."""
         context = self._get_conversation_context(user_id)
         user_message = self._render_q_user_template(
             usr_t,
@@ -656,8 +868,26 @@ Classify now."""
             "provider_used": "failed"
         }
 
-    def execute_query(self, sql: str, db_path: str = None) -> Dict[str, Any]:
-        """Execute SQL against the configured app database (SQLite or PostgreSQL via DATABASE_URL)."""
+    def execute_query(self, sql: str, user_id: Optional[int] = None) -> Dict[str, Any]:
+        """Execute SQL against PostgreSQL (DATABASE_URL). Optional user_id re-validates guardrail."""
+        if user_id is not None and sql:
+            sql_norm = " ".join(sql.split())
+            uid = str(user_id)
+            has_user_scope = (
+                f"user_id = {uid}" in sql_norm
+                or f"user_id={uid}" in sql_norm.replace(" ", "")
+                or (
+                    " from users " in f" {sql_norm.lower()} "
+                    and f"id = {uid}" in sql_norm
+                )
+            )
+            if not sql_norm.upper().startswith("SELECT") or not has_user_scope:
+                return {
+                    "columns": [],
+                    "rows": [],
+                    "row_count": 0,
+                    "error": f"Security error: query must be SELECT and scoped to user_id={user_id}",
+                }
         try:
             with engine.connect() as conn:
                 result = conn.execute(text(sql))
@@ -717,7 +947,46 @@ Classify now."""
             return result.data["content"].strip()
         return default_reply
 
-    def ask_ai(self, user_query: str, user_id: int, db_path: str = "bot_data.db") -> Dict[str, Any]:
+    @staticmethod
+    def _user_display_name(user: Any) -> Optional[str]:
+        parts = []
+        if getattr(user, "first_name", None):
+            parts.append(str(user.first_name).strip())
+        if getattr(user, "last_name", None):
+            parts.append(str(user.last_name).strip())
+        name = " ".join(p for p in parts if p)
+        if name:
+            return name
+        username = getattr(user, "username", None)
+        if username:
+            return f"@{username}"
+        return None
+
+    def _build_identity_profile_response(self, user_query: str, user_id: int) -> str:
+        user = DatabaseService.get_user_by_id(user_id)
+        if not user:
+            return "User profile nahi mila."
+
+        display = self._user_display_name(user)
+        hindi = bool(re.search(r"[\u0900-\u097F]", user_query)) or bool(
+            re.search(r"(?i)\b(kon|kaun|mera|naam|hu|hoon|aap)\b", user_query)
+        )
+
+        if display:
+            if hindi:
+                return f"Aap {display} hain — ye aapka Telegram profile naam hai."
+            return f"You are {display} — that's your Telegram profile name."
+
+        if hindi:
+            return (
+                "Aapka naam abhi database me save nahi hai. "
+                "Telegram me profile naam set karein, phir dubara try karein."
+            )
+        return (
+            "Your name isn't saved yet. Set your name on Telegram and try again."
+        )
+
+    def ask_ai(self, user_query: str, user_id: int) -> Dict[str, Any]:
         """
         Complete pipeline with orchestration:
         1. Understand Intent (GPT-4o)
@@ -726,49 +995,6 @@ Classify now."""
         4. Execute Query
         5. Format Response (GPT-4o)
         """
-        # Guardrail: deterministic handling for full expense summary asks
-        if self._should_use_global_summary_sql(user_query, user_id):
-            sql = self._build_global_summary_sql(user_id)
-            exec_result = self.execute_query(sql, db_path)
-
-            if exec_result.get("error"):
-                logger.info("Deterministic summary SQL failed, falling back to intent pipeline")
-            else:
-                data = exec_result.get("rows", [])
-                ai_response = self._format_response(user_query, sql, data, user_id)
-                self._add_to_history(user_id, user_query, ai_response)
-                return {
-                    "success": True,
-                    "sql": sql,
-                    "explanation": "Deterministic aggregate summary query",
-                    "error": None,
-                    "data": data,
-                    "row_count": exec_result.get("row_count", 0),
-                    "columns": exec_result.get("columns", []),
-                    "ai_response": ai_response,
-                    "provider_used": "deterministic"
-                }
-
-        # Guardrail: deterministic rent total including manual text entries.
-        if self._is_rent_query(user_query):
-            sql = self._build_rent_total_sql(user_id)
-            exec_result = self.execute_query(sql, db_path)
-            if not exec_result.get("error"):
-                data = exec_result.get("rows", [])
-                ai_response = self._format_response(user_query, sql, data, user_id)
-                self._add_to_history(user_id, user_query, ai_response)
-                return {
-                    "success": True,
-                    "sql": sql,
-                    "explanation": "Deterministic rent total query across documents + user_text_entries",
-                    "error": None,
-                    "data": data,
-                    "row_count": exec_result.get("row_count", 0),
-                    "columns": exec_result.get("columns", []),
-                    "ai_response": ai_response,
-                    "provider_used": "deterministic"
-                }
-
         # Step 1: Intent Classification
         intent_analysis = self._understand_intent(user_query, user_id)
         logger.info(f"Intent analysis for '{user_query}': {intent_analysis}")
@@ -776,10 +1002,20 @@ Classify now."""
         intent = intent_analysis.get("intent", "unknown")
         confidence = intent_analysis.get("confidence", 0)
 
-        # Route based on intent
-        if intent == "semantic_search" or intent == "unknown" or confidence < 0.6:
-            logger.info(f"Routing to semantic search (intent: {intent}, confidence: {confidence})")
-            return self._vector_search_fallback(user_query, user_id, f"Intent: {intent}")
+        # Document/data questions use PostgreSQL + Chroma (hybrid), scoped by user_id.
+        # Route user_info here too; short Hinglish follow-ups like "kaha gya tha me"
+        # are often expense-context questions, not profile questions.
+        if intent in ("sql_query", "semantic_search", "unknown", "user_info") or confidence < 0.6:
+            logger.info(
+                "Hybrid SQL+vector routing (intent=%s, confidence=%s)",
+                intent,
+                confidence,
+            )
+            return self._hybrid_sql_and_vector_query(
+                user_query,
+                user_id,
+                route_reason=f"intent={intent},confidence={confidence}",
+            )
 
         if intent == "greeting":
             response = self._generate_social_response(user_query, mode="greeting")
@@ -809,89 +1045,87 @@ Classify now."""
                 "ai_response": response
             }
 
-        if intent == "user_info":
-            # Check if user wants to see vendors
-            if "vendor" in user_query.lower() or "seller" in user_query.lower():
-                vendors = DatabaseService.get_distinct_vendor_names(user_id)
+        # Any other intent: hybrid retrieval as safe default.
+        return self._hybrid_sql_and_vector_query(user_query, user_id, route_reason=f"intent={intent}")
 
-                if vendors:
-                    response = f"Aapke documents me ye vendors hain: {', '.join(vendors)}"
-                else:
-                    response = "Aapke documents me koi vendor information nahi hai."
-                self._add_to_history(user_id, user_query, response)
-                return {
-                    "success": True,
-                    "sql": None,
-                    "explanation": None,
-                    "error": None,
-                    "data": None,
-                    "row_count": 0,
-                    "columns": None,
-                    "ai_response": response
-                }
-            
-            response = self._generate_social_response(user_query, mode="user_info")
-            self._add_to_history(user_id, user_query, response)
+    def _hybrid_sql_and_vector_query(
+        self, user_query: str, user_id: int, route_reason: str = ""
+    ) -> Dict[str, Any]:
+        """Answer using PostgreSQL (SQL) and Chroma (vector), merged for the same user_id."""
+        resolution = self._resolve_query_with_context(user_query, user_id)
+        effective_query = resolution["effective_query"]
+        focus = resolution.get("focus", "")
+        vector_items = self._retrieve_vector_hits(effective_query, user_id)
+        sql_result = self.generate_sql(effective_query, user_id)
+        sql = sql_result.get("sql") if sql_result.get("is_safe") else None
+        sql_rows: List[Dict[str, Any]] = []
+        exec_error: Optional[str] = None
+        exec_result: Dict[str, Any] = {"columns": [], "rows": [], "row_count": 0}
+
+        if sql:
+            exec_result = self.execute_query(sql, user_id=user_id)
+            exec_error = exec_result.get("error")
+            if not exec_error:
+                sql_rows = exec_result.get("rows") or []
+
+        if sql_rows:
+            ai_response = self._format_response(
+                user_query,
+                sql or "",
+                sql_rows,
+                user_id,
+                vector_supplement=vector_items,
+                resolved_query=effective_query,
+                focus=focus,
+            )
+            self._add_to_history(user_id, user_query, ai_response)
+            try:
+                self._store_sql_results(effective_query, sql or "", sql_rows, user_id)
+            except Exception as e:
+                logger.warning("Failed to store SQL results in vector DB (non-critical): %s", e)
             return {
                 "success": True,
-                "sql": None,
-                "explanation": None,
+                "sql": sql,
+                "explanation": sql_result.get("explanation"),
                 "error": None,
-                "data": None,
-                "row_count": 0,
-                "columns": None,
-                "ai_response": response
+                "data": sql_rows,
+                "row_count": len(sql_rows),
+                "columns": exec_result.get("columns") if sql else [],
+                "ai_response": ai_response,
+                "provider_used": sql_result.get("provider_used", "unknown"),
+                "hybrid": True,
+                "vector_hits": len(vector_items),
             }
 
-        # Step 2: Generate SQL (via orchestrator with GPT-4o/Anthropic)
-        sql_result = self.generate_sql(user_query, user_id)
-        logger.info(f"Generated SQL: {sql_result.get('sql', 'NONE')}")
-
-        # FALLBACK: If SQL generation fails
-        if not sql_result.get("is_safe") or not sql_result.get("sql"):
-            logger.info(f"SQL generation failed for user {user_id}, falling back to vector search")
-            return self._vector_search_fallback(user_query, user_id, sql_result.get("error"))
-
-        sql = sql_result["sql"]
-
-        # Step 3: Execute query
-        exec_result = self.execute_query(sql, db_path)
-
-        # FALLBACK: If SQL execution fails or returns empty
-        if exec_result.get("error"):
-            logger.info(f"SQL execution failed for user {user_id}, falling back to vector search")
-            return self._vector_search_fallback(user_query, user_id, exec_result["error"])
-
-        if exec_result.get("row_count", 0) == 0:
-            logger.info(f"SQL returned 0 rows for user {user_id}, falling back to vector search with context")
-            return self._vector_search_fallback(user_query, user_id, "SQL query returned no matching rows")
-
-        # Step 4: Format response
-        data = exec_result["rows"]
-        ai_response = self._format_response(user_query, sql, data, user_id)
-        
-        # Add to conversation history
-        self._add_to_history(user_id, user_query, ai_response)
-
-        # Step 5: Store SQL results in vector DB
-        try:
-            self._store_sql_results(user_query, sql, data, user_id)
-        except Exception as e:
-            logger.warning(f"Failed to store SQL results (non-critical): {e}")
+        if vector_items:
+            return self._answer_from_vector_hits(
+                user_query,
+                user_id,
+                vector_items,
+                sql_error=exec_error or sql_result.get("error") or route_reason,
+                resolved_query=effective_query,
+                focus=focus,
+            )
 
         return {
-            "success": True,
+            "success": False,
             "sql": sql,
             "explanation": sql_result.get("explanation"),
-            "error": None,
-            "data": data,
-            "row_count": exec_result["row_count"],
-            "columns": exec_result["columns"],
-            "ai_response": ai_response,
-            "provider_used": sql_result.get("provider_used", "unknown")
+            "error": exec_error or sql_result.get("error") or route_reason,
+            "data": None,
+            "ai_response": "No matching data found in your documents for this question.",
         }
 
-    def _format_response(self, user_query: str, sql: str, data: List[Dict], user_id: int) -> str:
+    def _format_response(
+        self,
+        user_query: str,
+        sql: str,
+        data: List[Dict],
+        user_id: int,
+        vector_supplement: Optional[List[Dict[str, Any]]] = None,
+        resolved_query: Optional[str] = None,
+        focus: str = "",
+    ) -> str:
         """Format SQL results using GPT-4o via orchestrator."""
         # Deterministic reply for aggregate summary rows to avoid context bleed.
         if data and len(data) == 1 and {"total_documents", "total_amount", "unique_vendors", "avg_amount"}.issubset(set(data[0].keys())):
@@ -915,21 +1149,41 @@ Classify now."""
                 f"• Aapke text entries se: ₹{txt_rent:,.2f}"
             )
 
-        q = (user_query or "").lower()
-        is_list_request = any(token in q for token in ["list", "all", "saare", "sabhi", "vendors", "vendor", "sellers"])
-        formatter_limit = 100 if is_list_request else 20
+        formatter_limit = 100
         formatter_rows = data[:formatter_limit]
         data_summary = (
             json.dumps(formatter_rows, indent=2, default=str) if data else "[]"
         )
+        if vector_supplement:
+            vec_rows = _rows_for_llm(vector_supplement[:5])
+            data_summary += (
+                "\n\nAdditional semantic matches from vector DB (same user only):\n"
+                + json.dumps(vec_rows, indent=2, default=str)
+            )
         row_count = len(data)
 
         sys_t, usr_t = self._q_tpl_pair("q_telegram_format_sql_response")
-        system_prompt = sys_t
+        system_prompt = sys_t + """
+
+Runtime grounding rules:
+- Use only the provided rows and previous conversation context. If a requested vendor/entity/item is not supported by the rows, say it was not found.
+- Requested city/location/entity words are hard filters. Do not answer with a row unless that row's vendor/title/raw_data/extracted_data/text explicitly supports the requested location/entity.
+- If the user asks "or Delhi/Dehli se" after a Lucknow answer, keep the same item/category context but require Delhi/Dehli support in the row; otherwise say it was not found.
+- For petrol/fuel questions, fuel-station receipts count as petrol/fuel evidence even if OCR item names are generic like "Product 1". Use vendor/title/category/raw_data terms such as Fuel/Fuels, Petrol, Diesel, Oil, IndianOil, IOCL, HPCL, BPCL, pump, or filling station.
+- If the row supports the requested location and is a fuel-station receipt, use its total amount for "kitne ka fill karwaya" style questions.
+- Treat raw_data, extracted_data, extracted_data_raw, and nested OCR JSON as first-class answer data.
+- Treat user_text_entries.text as first-class answer data for manual expenses. If the user asks where they went, what they bought, or when, infer it from that saved text and its created_at only.
+- For item questions, inspect item description/name plus quantity, unit price/price, amount/total. Do not answer with receipt total unless the user asked for the whole bill total.
+- For follow-up questions, honor the resolved question/focus below over broad semantic matches.
+- Do not transfer items from one vendor/document to another unless the data explicitly supports that relationship."""
         context = self._get_conversation_context(user_id)
+        resolved_line = ""
+        if resolved_query and resolved_query.strip() and resolved_query.strip() != user_query.strip():
+            resolved_line = f"\nResolved question from context: \"{resolved_query.strip()}\""
+        focus_line = f"\nAnswer focus: {focus.strip()}" if focus.strip() else ""
         user_message = self._render_q_user_template(
             usr_t,
-            user_query=user_query,
+            user_query=user_query + resolved_line + focus_line,
             row_count=str(row_count),
             data_summary=data_summary,
             context=context,
@@ -939,7 +1193,7 @@ Classify now."""
             system_prompt=system_prompt,
             user_message=user_message,
             functions=[],  # No function calling needed for formatting
-            temperature=0.7,
+            temperature=0.5,
             max_tokens=1024
         )
 
@@ -980,14 +1234,8 @@ Classify now."""
             query_hash = hashlib.md5(f"{user_id}:{user_query}:{sql}".encode()).hexdigest()[:12]
             result_id = f"sql_result_{user_id}_{query_hash}_{int(time.time())}"
 
-            # Use OpenAI for embeddings (separate from orchestrator LLM)
-            import openai
-            openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            response = openai_client.embeddings.create(
-                model="text-embedding-3-small",
-                input=searchable_text[:8000]
-            )
-            embedding = response.data[0].embedding
+            # Use the shared OpenAI embedding path so dimensions/model stay consistent.
+            embedding = self.vector_service._generate_embedding(searchable_text)
 
             self.vector_service.collection.upsert(
                 ids=[result_id],
@@ -1009,6 +1257,175 @@ Classify now."""
             logger.error(f"Error storing SQL results: {e}")
             raise
 
+    def _retrieve_vector_hits(
+        self, user_query: str, user_id: int, n_results: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Chroma semantic search + SQL token match, enriched from PostgreSQL (user_id scoped)."""
+        results = self.vector_service.search(
+            query=user_query,
+            user_id=user_id,
+            n_results=n_results,
+        )
+
+        if not results:
+            return []
+
+        data: List[Dict[str, Any]] = []
+        for r in results:
+            if r.get("entry_type") == "user_text_entry":
+                title = f"Text Entry #{r.get('text_entry_id')} (Score: {r['similarity_score']}%)"
+                item_type = "user_text_entry"
+            else:
+                title = f"Doc #{r['doc_id']} (Score: {r['similarity_score']}%)"
+                item_type = "document"
+            data.append({
+                "type": item_type,
+                "title": title,
+                "amount": None,
+                "vendor": None,
+                "date": None,
+                "text_entry_id": r.get("text_entry_id"),
+                "_text": r.get("text", ""),
+                "_score": r.get("similarity_score", 0),
+            })
+
+        try:
+            doc_ids: List[int] = []
+            for r in results:
+                if r.get("entry_type") == "user_text_entry":
+                    continue
+                did = r.get("doc_id")
+                if did is None:
+                    continue
+                try:
+                    doc_ids.append(int(did))
+                except (TypeError, ValueError):
+                    continue
+            doc_details = DatabaseService.fetch_documents_for_vector_enrichment(user_id, doc_ids)
+
+            text_entry_ids: List[int] = []
+            for r in results:
+                if r.get("entry_type") != "user_text_entry":
+                    continue
+                tid = r.get("text_entry_id")
+                if tid is None:
+                    continue
+                try:
+                    text_entry_ids.append(int(tid))
+                except (TypeError, ValueError):
+                    continue
+            text_entry_details = DatabaseService.fetch_user_text_entries_for_vector_enrichment(
+                user_id, text_entry_ids
+            )
+
+            for i, item in enumerate(data):
+                result_row = results[i]
+                if result_row.get("entry_type") == "user_text_entry":
+                    teid = result_row.get("text_entry_id")
+                    try:
+                        teid = int(teid) if teid is not None else None
+                    except (TypeError, ValueError):
+                        teid = None
+                    if teid in text_entry_details:
+                        t = text_entry_details[teid]
+                        item["entry_kind"] = "user_text_entry"
+                        item["type"] = "user_text_entry"
+                        item["title"] = f"Expense Note #{teid}"
+                        item["amount"] = t.get("amount")
+                        item["currency"] = t.get("currency")
+                        item["expense_category"] = t.get("expense_category")
+                        item["date"] = t.get("created_at")
+                        item["user_text_body"] = t.get("text")
+                    continue
+
+                doc_id = result_row.get("doc_id")
+                try:
+                    doc_key = int(doc_id) if doc_id is not None else None
+                except (TypeError, ValueError):
+                    doc_key = None
+                if doc_key is not None and doc_key in doc_details:
+                    d = doc_details[doc_key]
+                    item["entry_kind"] = "document"
+                    item["id"] = d.get("id")
+                    item["type"] = d.get("document_type") or "document"
+                    item["title"] = d.get("title") or d.get("file_name") or f"Document {doc_key}"
+                    item["amount"] = d.get("total_amount")
+                    item["vendor"] = d.get("vendor_name")
+                    item["date"] = d.get("created_at") or d.get("document_date")
+                    item["extracted_data"] = d.get("extracted_data")
+        except Exception as e:
+            logger.warning("Could not enrich vector results: %s", e)
+
+        min_score = 50.0
+        filtered = [d for d in data if d.get("_score", 0) >= min_score]
+        if not filtered and data:
+            filtered = sorted(data, key=lambda x: x.get("_score", 0), reverse=True)[:1]
+        else:
+            filtered = sorted(filtered, key=lambda x: x.get("_score", 0), reverse=True)[:3]
+        return filtered
+
+    def _answer_from_vector_hits(
+        self,
+        user_query: str,
+        user_id: int,
+        vector_items: List[Dict[str, Any]],
+        sql_error: Optional[str] = None,
+        resolved_query: Optional[str] = None,
+        focus: str = "",
+    ) -> Dict[str, Any]:
+        """Format an answer from vector hits (already user-scoped)."""
+        llm_rows = _rows_for_llm(vector_items)
+        data_summary = json.dumps(llm_rows, indent=2, default=str)
+        sys_t, usr_t = self._q_tpl_pair("q_telegram_vector_semantic")
+        sys_t += """
+
+Runtime grounding rules:
+- Use only the retrieved rows and conversation context. If the requested vendor/entity/item is not supported by these rows, say it was not found.
+- Requested city/location/entity words are hard filters. Do not answer with a retrieved row unless its text/vendor/title/extracted data explicitly supports that location/entity.
+- If a location follow-up asks for another city (for example Delhi/Dehli after Lucknow), keep the item/category context but require that new city in the retrieved row.
+- For petrol/fuel questions, fuel-station receipts count as petrol/fuel evidence even when OCR item names are generic like "Product 1". Use the receipt total for "kitne ka fill karwaya" when the retrieved row supports the requested location.
+- Treat extracted_data, extracted_data_raw, raw_data, and nested OCR JSON as first-class answer data.
+- Treat user_text_body/text from manual expenses as first-class answer data. Use it for saved purchase/travel details and follow-ups.
+- For item questions, inspect item description/name plus quantity, unit price/price, amount/total. Do not answer with receipt total unless the user asked for the whole bill total.
+- Honor the resolved question/focus below and ignore unrelated semantic matches."""
+        hist = self._get_conversation_context(user_id)
+        resolved_line = ""
+        if resolved_query and resolved_query.strip() and resolved_query.strip() != user_query.strip():
+            resolved_line = f"\nResolved question from context: \"{resolved_query.strip()}\""
+        focus_line = f"\nAnswer focus: {focus.strip()}" if focus.strip() else ""
+        user_message = self._render_q_user_template(
+            usr_t,
+            user_query=user_query + resolved_line + focus_line,
+            data_summary=data_summary,
+            row_count=str(len(vector_items)),
+            context=hist,
+        )
+        llm_result = self.orchestrator.execute_with_fallback(
+            system_prompt=sys_t,
+            user_message=user_message,
+            functions=[],
+            temperature=0.5,
+            max_tokens=768,
+        )
+        ai_response = (
+            llm_result.data.get("content", "").strip()
+            if llm_result.success and llm_result.data
+            else "Yeh raha aapka document."
+        )
+        self._add_to_history(user_id, user_query, ai_response)
+        return {
+            "success": True,
+            "sql": f"-- HYBRID VECTOR --\n-- user_id = {user_id}",
+            "explanation": "Semantic search (vector DB + SQL enrichment)",
+            "error": sql_error,
+            "data": vector_items,
+            "row_count": len(vector_items),
+            "columns": ["type", "title", "amount", "vendor", "date"],
+            "ai_response": ai_response,
+            "fallback": True,
+            "hybrid": True,
+        }
+
     def _vector_search_fallback(self, user_query: str, user_id: int, error_reason: str = None) -> Dict[str, Any]:
         """Semantic search fallback when SQL fails."""
         import hashlib
@@ -1024,214 +1441,24 @@ Classify now."""
                 return cached_result
 
         try:
-            # Get conversation context to improve search
-            context = self._get_conversation_context(user_id)
-            enhanced_query = f"{user_query}{context}"
-            
-            results = self.vector_service.search(
-                query=enhanced_query,
-                user_id=user_id,
-                n_results=10
-            )
-            logger.info(f"Vector search with context: query_len={len(user_query)}, context_len={len(context)}")
-
-            # Supplement embedding hits with SQL substring match on vendor / extracted_data / title
-            # (fixes "docubee" queries when Chroma similarity is weak or index stale).
-            seen_doc_ids: set = set()
-            merged_results: List[Dict[str, Any]] = []
-            for r in results:
-                merged_results.append(dict(r))
-                did = r.get("doc_id")
-                if did is not None:
-                    try:
-                        seen_doc_ids.add(int(did))
-                    except (TypeError, ValueError):
-                        pass
-            try:
-                for doc in DatabaseService.find_documents_matching_query_tokens(user_id, user_query):
-                    if doc.id not in seen_doc_ids:
-                        seen_doc_ids.add(doc.id)
-                        merged_results.append({
-                            "doc_id": doc.id,
-                            "text_entry_id": None,
-                            "entry_type": "document",
-                            "user_id": user_id,
-                            "text": "",
-                            "similarity_score": 55.0,
-                            "source": "sql_text_match",
-                        })
-                results = merged_results
-                logger.info(
-                    "Vector+SQL merge: %s hits total after text fallback",
-                    len(results),
-                )
-            except Exception as e:
-                logger.warning("SQL text-match supplement failed (non-fatal): %s", e)
-
-            if not results:
+            vector_items = self._retrieve_vector_hits(user_query, user_id)
+            if not vector_items:
                 result = {
                     "success": False,
                     "sql": None,
                     "explanation": "Vector search fallback",
                     "error": error_reason or "No matching documents found",
                     "data": None,
-                    "ai_response": "I'm telegram bot i am not able to understand your query"
+                    "ai_response": "I'm telegram bot i am not able to understand your query",
                 }
                 if not hasattr(self, '_search_cache'):
                     self._search_cache = {}
                 self._search_cache[cache_key] = (time.time(), result)
                 return result
 
-            # Format results
-            data = []
-            for r in results:
-                if r.get("entry_type") == "user_text_entry":
-                    title = f"Text Entry #{r.get('text_entry_id')} (Score: {r['similarity_score']}%)"
-                    item_type = "user_text_entry"
-                else:
-                    title = f"Doc #{r['doc_id']} (Score: {r['similarity_score']}%)"
-                    item_type = "document"
-                data.append({
-                    "type": item_type,
-                    "title": title,
-                    "amount": None,
-                    "vendor": None,
-                    "date": None,
-                    "text_entry_id": r.get("text_entry_id"),
-                    "_text": r["text"],
-                    "_score": r["similarity_score"]
-                })
-
-            # Enrich with DB data (same DB as DATABASE_URL — not a separate bot_data.db file)
-            try:
-                doc_ids = []
-                for r in results:
-                    if r.get("entry_type") == "user_text_entry":
-                        continue
-                    did = r.get("doc_id")
-                    if did is None:
-                        continue
-                    try:
-                        doc_ids.append(int(did))
-                    except (TypeError, ValueError):
-                        continue
-                doc_details = DatabaseService.fetch_documents_for_vector_enrichment(user_id, doc_ids)
-
-                text_entry_ids = []
-                for r in results:
-                    if r.get("entry_type") != "user_text_entry":
-                        continue
-                    tid = r.get("text_entry_id")
-                    if tid is None:
-                        continue
-                    try:
-                        text_entry_ids.append(int(tid))
-                    except (TypeError, ValueError):
-                        continue
-                text_entry_details = DatabaseService.fetch_user_text_entries_for_vector_enrichment(
-                    user_id, text_entry_ids
-                )
-
-                for i, item in enumerate(data):
-                    result_row = results[i]
-                    if result_row.get("entry_type") == "user_text_entry":
-                        teid = result_row.get("text_entry_id")
-                        try:
-                            teid = int(teid) if teid is not None else None
-                        except (TypeError, ValueError):
-                            teid = None
-                        if teid in text_entry_details:
-                            t = text_entry_details[teid]
-                            item["entry_kind"] = "user_text_entry"
-                            item["type"] = "user_text_entry"
-                            item["title"] = f"Expense Note #{teid}"
-                            item["amount"] = t.get("amount")
-                            item["currency"] = t.get("currency")
-                            item["expense_category"] = t.get("expense_category")
-                            item["date"] = t.get("created_at")
-                            item["user_text_body"] = t.get("text")
-                        continue
-
-                    doc_id = result_row.get("doc_id")
-                    # Normalize id type (Chroma / drivers may vary)
-                    try:
-                        doc_key = int(doc_id) if doc_id is not None else None
-                    except (TypeError, ValueError):
-                        doc_key = None
-                    if doc_key is not None and doc_key in doc_details:
-                        d = doc_details[doc_key]
-                        item["entry_kind"] = "document"
-                        item["id"] = d.get("id")
-                        item["type"] = d.get("document_type") or "document"
-                        item["title"] = d.get("title") or d.get("file_name") or f"Document {doc_key}"
-                        item["amount"] = d.get("total_amount")
-                        item["vendor"] = d.get("vendor_name")
-                        item["date"] = d.get("created_at") or d.get("document_date")
-                        item["extracted_data"] = d.get("extracted_data")
-                    elif doc_key is not None:
-                        logger.warning(
-                            "Vector hit doc_id=%s but no DB row for user_id=%s (re-index Chroma or fix DB)",
-                            doc_key,
-                            user_id,
-                        )
-
-            except Exception as e:
-                logger.warning(f"Could not enrich vector results: {e}")
-
-            # Filter by score threshold
-            MIN_SCORE_THRESHOLD = 50.0
-            filtered_data = [d for d in data if d.get('_score', 0) >= MIN_SCORE_THRESHOLD]
-
-            if not filtered_data and data:
-                data_sorted = sorted(data, key=lambda x: x.get('_score', 0), reverse=True)
-                filtered_data = data_sorted[:1]
-                low_confidence = True
-            else:
-                low_confidence = False
-                data_sorted = sorted(filtered_data, key=lambda x: x.get('_score', 0), reverse=True)
-                filtered_data = data_sorted[:3]
-
-            # LLM sees DB-backed rows only: denormalized columns + full extracted_data JSON (same user_id as query)
-            llm_rows = _rows_for_llm(filtered_data)
-            data_summary = json.dumps(llm_rows, indent=2, default=str)
-            row_count = len(filtered_data)
-
-            sys_t, usr_t = self._q_tpl_pair("q_telegram_vector_semantic")
-            system_prompt = sys_t
-            hist = self._get_conversation_context(user_id)
-            user_message = self._render_q_user_template(
-                usr_t,
-                user_query=user_query,
-                data_summary=data_summary,
-                row_count=str(row_count),
-                context=hist,
+            result = self._answer_from_vector_hits(
+                user_query, user_id, vector_items, sql_error=error_reason
             )
-
-            llm_result = self.orchestrator.execute_with_fallback(
-                system_prompt=system_prompt,
-                user_message=user_message,
-                functions=[],
-                temperature=0.5,
-                max_tokens=768
-            )
-
-            ai_response = llm_result.data.get("content", "") if llm_result.success else "Yeh raha aapka document."
-            
-            # Add to conversation history
-            self._add_to_history(user_id, user_query, ai_response)
-
-            result = {
-                "success": True,
-                "sql": f"-- VECTOR SEARCH --\n-- Original query: {user_query}\n-- Guardrail: user_id = {user_id}",
-                "explanation": f"Semantic search results",
-                "error": None,
-                "data": filtered_data,
-                "row_count": len(filtered_data),
-                "columns": ["type", "title", "amount", "vendor", "date"],
-                "ai_response": ai_response,
-                "fallback": True,
-            }
-
             if not hasattr(self, '_search_cache'):
                 self._search_cache = {}
             self._search_cache[cache_key] = (time.time(), result)

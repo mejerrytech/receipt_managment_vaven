@@ -417,7 +417,7 @@ class ModelOrchestrator:
     def _get_nlp_to_sql_system_prompt(self, context: Dict) -> str:
         """Get system prompt for NLP to SQL agent."""
         user_id = context.get("user_id", 0)
-        return f"""You are an AI assistant that converts natural language questions into safe SQLite SQL queries.
+        return f"""You are an AI assistant that converts natural language questions into safe PostgreSQL SQL queries.
 
 DATABASE SCHEMA:
 Tables:
@@ -453,7 +453,7 @@ CRITICAL SECURITY RULES:
 2. NEVER access data of other users
 3. ONLY generate SELECT queries (NO INSERT, UPDATE, DELETE, DROP, ALTER)
 4. "my" always refers to user_id = {user_id}
-5. Return only valid SQLite SQL
+5. Return only valid PostgreSQL SQL
 
 UI RESPONSE FORMAT RULES:
 The frontend expects these columns ONLY (NO id, NO user_id):

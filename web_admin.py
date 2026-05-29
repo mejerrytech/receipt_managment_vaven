@@ -1,44 +1,44 @@
 """FastAPI Web Admin Panel for Bot Data"""
 
-import sqlite3
 import json
-import os
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
 from fastapi import FastAPI, Request, Query, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-from dotenv import load_dotenv
+from sqlalchemy import text
+
+from shared.env import load_project_dotenv
+
+load_project_dotenv()
 
 # Import NLP-to-SQL service
 from shared.nlp_sql_service import get_nlp_sql_service
 # Import OCR service
 from shared.ocr_service import get_ocr_service
 # Import database service
-from shared.database import DatabaseService
-
-load_dotenv()
+from shared.database import DatabaseService, engine, init_db, DATABASE_URL
 
 app = FastAPI(title="Bot Admin Panel")
 
-DB_PATH = "bot_data.db"
+
+@app.on_event("startup")
+def _ensure_database_ready():
+    """Create tables if missing; log which DB dialect is in use."""
+    init_db()
+    logger = __import__("logging").getLogger("web_admin")
+    logger.info("Database ready: %s (%s)", engine.dialect.name, DATABASE_URL.split("@")[-1])
 
 # Store current user session (simple approach - in production use proper auth)
 # This stores the currently selected user_id for the session
 current_session = {"user_id": None, "user_name": None}
 
 
-def get_db_path():
-    """Get the database file path."""
-    return Path(DB_PATH)
-
-
 @contextmanager
 def get_db():
-    """Database connection context manager."""
-    conn = sqlite3.connect(get_db_path())
-    conn.row_factory = sqlite3.Row  # Enable column access by name
+    """Database connection context manager (PostgreSQL via DATABASE_URL)."""
+    conn = engine.connect()
     try:
         yield conn
     finally:
@@ -49,13 +49,12 @@ def get_db():
 def get_users():
     """Get all users from database."""
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        result = conn.execute(text("""
             SELECT id, telegram_id, first_name, last_name, username, created_at, updated_at
             FROM users
             ORDER BY created_at DESC
-        """)
-        rows = cursor.fetchall()
+        """))
+        rows = result.mappings().all()
 
         return [
             {
@@ -74,15 +73,14 @@ def get_users():
 def get_documents(limit: int = 100):
     """Get all documents from database."""
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+        result = conn.execute(text("""
             SELECT d.*, u.telegram_id, u.username
             FROM documents d
             LEFT JOIN users u ON d.user_id = u.id
             ORDER BY d.created_at DESC
-            LIMIT ?
-        """, (limit,))
-        rows = cursor.fetchall()
+            LIMIT :limit
+        """), {"limit": limit})
+        rows = result.mappings().all()
 
         result = []
         for row in rows:
@@ -109,6 +107,7 @@ def get_documents(limit: int = 100):
                 "vendor_name": row["vendor_name"],
                 "invoice_number": row["invoice_number"],
                 "gstin": row["gstin"],
+                "expense_category": row["expense_category"] if "expense_category" in row.keys() else None,
                 "confidence_overall": row["confidence_overall"],
                 "extracted_data": extracted_data,
                 "created_at": row["created_at"]
@@ -116,28 +115,55 @@ def get_documents(limit: int = 100):
         return result
 
 
+@app.get("/api/expense-categories")
+def get_expense_categories():
+    """Canonical expense category list for UI dropdowns."""
+    return {"categories": DatabaseService.list_expense_categories()}
+
+
+@app.get("/api/user-expenses")
+def get_user_expenses(category: Optional[str] = None, limit: int = 200):
+    """Documents + text entries for current user, optionally filtered by category."""
+    if current_session["user_id"] is None:
+        raise HTTPException(status_code=400, detail="No user selected")
+    items = DatabaseService.get_user_expense_items(
+        current_session["user_id"],
+        category=category or None,
+        limit=limit,
+    )
+    return {"items": items, "count": len(items)}
+
+
+class DocumentCategoryUpdate(BaseModel):
+    expense_category: str
+
+
+@app.patch("/api/documents/{doc_id}/category")
+def patch_document_category(doc_id: int, body: DocumentCategoryUpdate):
+    if current_session["user_id"] is None:
+        raise HTTPException(status_code=400, detail="No user selected")
+    doc = DatabaseService.update_document_expense_category(
+        doc_id, current_session["user_id"], body.expense_category
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"success": True, "id": doc.id, "expense_category": doc.expense_category}
+
+
 @app.get("/api/stats")
 def get_stats():
     """Get database statistics."""
     with get_db() as conn:
-        cursor = conn.cursor()
-
-        # Count users
-        cursor.execute("SELECT COUNT(*) as count FROM users")
-        user_count = cursor.fetchone()["count"]
-
-        # Count documents
-        cursor.execute("SELECT COUNT(*) as count FROM documents")
-        doc_count = cursor.fetchone()["count"]
-
-        # Sum of all amounts
-        cursor.execute("SELECT SUM(total_amount) as total FROM documents WHERE total_amount IS NOT NULL")
-        total_amount = cursor.fetchone()["total"] or 0
+        user_count = conn.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
+        doc_count = conn.execute(text("SELECT COUNT(*) FROM documents")).scalar() or 0
+        total_amount = conn.execute(
+            text("SELECT COALESCE(SUM(total_amount), 0) FROM documents WHERE total_amount IS NOT NULL")
+        ).scalar() or 0
 
         return {
             "total_users": user_count,
             "total_documents": doc_count,
-            "total_amount": round(total_amount, 2)
+            "total_amount": round(float(total_amount), 2),
         }
 
 
@@ -192,9 +218,10 @@ def set_current_user(request: SetUserRequest):
     """Set the current user for the session (determines what data they can see)."""
     # Verify user exists
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, first_name, last_name, username FROM users WHERE id = ?", (request.user_id,))
-        user = cursor.fetchone()
+        user = conn.execute(
+            text("SELECT id, first_name, last_name, username FROM users WHERE id = :id"),
+            {"id": request.user_id},
+        ).mappings().first()
 
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
@@ -248,7 +275,7 @@ def ai_ask(request: ChatRequest):
     nlp_service = get_nlp_sql_service()
 
     # Process the query
-    result = nlp_service.ask_ai(request.query, user_id, DB_PATH)
+    result = nlp_service.ask_ai(request.query, user_id)
 
     return result
 
@@ -260,13 +287,16 @@ def get_my_documents():
         raise HTTPException(status_code=400, detail="No user selected")
 
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM documents
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-        """, (current_session["user_id"],))
-        rows = cursor.fetchall()
+        rows = conn.execute(
+            text(
+                """
+                SELECT * FROM documents
+                WHERE user_id = :user_id
+                ORDER BY created_at DESC
+                """
+            ),
+            {"user_id": current_session["user_id"]},
+        ).mappings().all()
 
         return [dict(row) for row in rows]
 
@@ -667,6 +697,25 @@ def dashboard(request: Request):
             font-weight: 600;
             color: #2563eb;
         }
+        .filter-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            align-items: center;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid #e0e0e0;
+            background: #fafafa;
+        }
+        .filter-bar label { font-size: 0.875rem; font-weight: 600; color: #555; }
+        .filter-bar select {
+            padding: 0.5rem 0.75rem;
+            border-radius: 8px;
+            border: 1px solid #ccc;
+            min-width: 220px;
+            font-size: 0.875rem;
+        }
+        .badge-category { background: #ede9fe; color: #5b21b6; font-size: 0.75rem; }
+        .badge-payment { background: #dcfce7; color: #166534; font-weight: 600; }
         .tabs {
             display: flex;
             gap: 0.5rem;
@@ -949,7 +998,7 @@ def dashboard(request: Request):
         </div>
 
         <div class="visual-dashboard">
-            <h2>📱 Expense Snapshot</h2>
+            <h2>📱 Expense by Category</h2>
             <div class="visual-grid">
                 <div class="donut-wrap" id="expense-donut">
                     <div class="donut-inner">
@@ -971,7 +1020,7 @@ def dashboard(request: Request):
             <div class="tab active" onclick="switchTab('ai-chat')">🤖 AI Assistant</div>
             <div class="tab" onclick="switchTab('pending')">📤 Upload & Review</div>
             <div class="tab" onclick="switchTab('users')">👥 Users</div>
-            <div class="tab" onclick="switchTab('documents')">📄 Documents</div>
+            <div class="tab" onclick="switchTab('documents')">🏷️ Categories & Payments</div>
         </div>
 
         <!-- AI Chat Tab -->
@@ -1063,17 +1112,24 @@ def dashboard(request: Request):
         <!-- Documents Tab -->
         <div id="documents-tab" class="tab-content">
             <div class="table-container">
+                <div class="filter-bar">
+                    <label for="category-filter">Category:</label>
+                    <select id="category-filter" onchange="loadDocuments()">
+                        <option value="">All categories</option>
+                    </select>
+                    <span id="category-filter-hint" style="font-size:0.875rem;color:#666;"></span>
+                </div>
                 <table>
                     <thead>
                         <tr>
                             <th>ID</th>
-                            <th>User</th>
-                            <th>Type</th>
+                            <th>Source</th>
+                            <th>Category</th>
+                            <th>Payment</th>
                             <th>Title</th>
-                            <th>Amount</th>
                             <th>Vendor</th>
                             <th>Date</th>
-                            <th>Extracted Data</th>
+                            <th>Type</th>
                         </tr>
                     </thead>
                     <tbody id="documents-table">
@@ -1087,7 +1143,25 @@ def dashboard(request: Request):
     <script>
         let currentUserId = null;
         let allUsers = [];
+        let expenseCategories = [];
         const dashboardPalette = ['#3b82f6', '#f97316', '#8b5cf6', '#06b6d4', '#ef4444', '#eab308'];
+
+        async function loadExpenseCategories() {
+            try {
+                const res = await fetch('/api/expense-categories');
+                const data = await res.json();
+                expenseCategories = data.categories || [];
+                const filter = document.getElementById('category-filter');
+                if (filter) {
+                    const current = filter.value;
+                    filter.innerHTML = '<option value="">All categories</option>' +
+                        expenseCategories.map(c => `<option value="${c}">${c}</option>`).join('');
+                    if (current) filter.value = current;
+                }
+            } catch (e) {
+                console.error('Failed to load categories:', e);
+            }
+        }
 
         // Load stats
         async function loadStats() {
@@ -1166,12 +1240,9 @@ def dashboard(request: Request):
             return '₹' + (value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
         }
 
-        function renderVisualDashboard(docs) {
-            const scopedDocs = currentUserId
-                ? docs.filter(d => String(d.user_id) === String(currentUserId))
-                : docs;
-
-            const totalAmount = scopedDocs.reduce((sum, d) => sum + (Number(d.total_amount) || 0), 0);
+        function renderVisualDashboard(expenseItems) {
+            const items = expenseItems || [];
+            const totalAmount = items.reduce((sum, d) => sum + (Number(d.payment) || 0), 0);
             const donut = document.getElementById('expense-donut');
             const donutTotal = document.getElementById('donut-total');
             const insightList = document.getElementById('insight-list');
@@ -1179,7 +1250,7 @@ def dashboard(request: Request):
 
             donutTotal.textContent = formatINR(totalAmount);
 
-            if (!scopedDocs.length || totalAmount <= 0) {
+            if (!items.length || totalAmount <= 0) {
                 donut.style.background = 'conic-gradient(#dbeafe 0 100%)';
                 insightList.innerHTML = '<div class="insight-item"><span class="left">No spending data found</span><span>—</span></div>';
                 categoryCards.innerHTML = '';
@@ -1187,10 +1258,10 @@ def dashboard(request: Request):
             }
 
             const byType = {};
-            scopedDocs.forEach(doc => {
-                const key = (doc.document_type || 'other').toLowerCase();
+            items.forEach(doc => {
+                const key = doc.expense_category || 'Other';
                 if (!byType[key]) byType[key] = { amount: 0, count: 0 };
-                byType[key].amount += Number(doc.total_amount) || 0;
+                byType[key].amount += Number(doc.payment) || 0;
                 byType[key].count += 1;
             });
 
@@ -1211,9 +1282,9 @@ def dashboard(request: Request):
                 .map(s => `${s.color} ${s.start.toFixed(2)}% ${s.end.toFixed(2)}%`)
                 .join(', ')})`;
 
-            const topVendor = scopedDocs.reduce((acc, d) => {
-                const vendor = d.vendor_name || 'Unknown';
-                const amount = Number(d.total_amount) || 0;
+            const topVendor = items.reduce((acc, d) => {
+                const vendor = d.vendor || 'Text / Unknown';
+                const amount = Number(d.payment) || 0;
                 if (!acc[vendor]) acc[vendor] = 0;
                 acc[vendor] += amount;
                 return acc;
@@ -1222,8 +1293,8 @@ def dashboard(request: Request):
 
             insightList.innerHTML = segments.slice(0, 5).map(s => `
                 <div class="insight-item">
-                    <span class="left"><span class="dot" style="background:${s.color}"></span>${s.key.replace('_', ' ')}</span>
-                    <span>${s.pct.toFixed(0)}% · ${formatINR(s.amount)}</span>
+                    <span class="left"><span class="dot" style="background:${s.color}"></span>${s.key}</span>
+                    <span>${s.pct.toFixed(0)}% · ${formatINR(s.amount)} · ${s.count} items</span>
                 </div>
             `).join('') + `
                 <div class="insight-item">
@@ -1232,18 +1303,10 @@ def dashboard(request: Request):
                 </div>
             `;
 
-            const iconMap = {
-                invoice: '🧾',
-                receipt: '🍽️',
-                'product listing': '🛍️',
-                bill: '💳',
-                other: '📦'
-            };
-
-            categoryCards.innerHTML = segments.slice(0, 6).map(s => `
+            categoryCards.innerHTML = segments.slice(0, 8).map(s => `
                 <div class="category-card">
-                    <div class="icon">${iconMap[s.key] || '📄'}</div>
-                    <div class="name">${s.key.replace('_', ' ')}</div>
+                    <div class="icon">🏷️</div>
+                    <div class="name">${s.key}</div>
                     <div class="value">${formatINR(s.amount)}</div>
                 </div>
             `).join('');
@@ -1425,46 +1488,71 @@ def dashboard(request: Request):
             }
         }
 
-        // Load documents
+        // Load categorized expenses (documents + text) for selected user
         async function loadDocuments() {
-            try {
-                const res = await fetch(\'/api/documents\');
-                const docs = await res.json();
-                const tbody = document.getElementById(\'documents-table\');
-                renderVisualDashboard(docs);
+            const tbody = document.getElementById(\'documents-table\');
+            const hint = document.getElementById(\'category-filter-hint\');
+            const categoryFilter = document.getElementById(\'category-filter\')?.value || \'\';
 
-                if (docs.length === 0) {
-                    tbody.innerHTML = \'<tr><td colspan="8" class="empty-state">No documents yet</td></tr>\';
+            if (!currentUserId) {
+                tbody.innerHTML = \'<tr><td colspan="8" class="empty-state">Select a user to see categorized expenses</td></tr>\';
+                renderVisualDashboard([]);
+                if (hint) hint.textContent = \'\';
+                return;
+            }
+
+            try {
+                const q = categoryFilter ? `?category=${encodeURIComponent(categoryFilter)}` : \'\';
+                const res = await fetch(`/api/user-expenses${q}`);
+                const payload = await res.json();
+                const items = payload.items || [];
+                renderVisualDashboard(items);
+                if (hint) hint.textContent = `${items.length} item(s)`;
+
+                if (items.length === 0) {
+                    tbody.innerHTML = \'<tr><td colspan="8" class="empty-state">No expenses in this category</td></tr>\';
                     return;
                 }
 
-                tbody.innerHTML = docs.map(d => {
-                    const docType = d.document_type || \'unknown\';
-                    const badgeClass = {
-                        \'invoice\': \'badge-green\',
-                        \'receipt\': \'badge-blue\',
-                        \'product listing\': \'badge-purple\'
-                    }[docType] || \'badge-orange\';
+                tbody.innerHTML = items.map(d => {
+                    const payment = d.payment != null ? formatINR(Number(d.payment)) : \'—\';
+                    const sourceLabel = d.source === \'text\' ? \'💬 Text\' : \'📄 Image\';
+                    const typeLabel = d.document_type || (d.source === \'text\' ? \'text_entry\' : \'-\');
+                    const categorySelect = d.source === \'document\'
+                        ? `<select onchange="updateDocumentCategory(${d.id}, this.value)" style="font-size:0.75rem;padding:0.25rem;border-radius:6px;max-width:160px;">
+                            ${expenseCategories.map(c => `<option value="${c}" ${c === d.expense_category ? \'selected\' : \'\'}>${c}</option>`).join(\'\')}
+                           </select>`
+                        : `<span class="badge badge-category">${d.expense_category || \'Other\'}</span>`;
 
                     return `
                     <tr>
                         <td>${d.id}</td>
-                        <td>${d.user_username ? \'@\' + d.user_username : d.user_telegram_id || \'-\'}</td>
-                        <td><span class="badge ${badgeClass}">${docType}</span></td>
-                        <td class="truncate" title="${d.title || \'\'}">${d.title || \'-\'}</td>
-                        <td class="amount">${d.total_amount ? \'₹\' + d.total_amount : \'-\'}</td>
-                        <td>${d.vendor_name || \'-\'}</td>
-                        <td>${d.document_date || d.created_at?.split(\'T\')[0] || \'-\'}</td>
-                        <td>
-                            <details>
-                                <summary>View JSON</summary>
-                                <div class="json-preview">${JSON.stringify(d.extracted_data, null, 2)}</div>
-                            </details>
-                        </td>
+                        <td>${sourceLabel}</td>
+                        <td>${categorySelect}</td>
+                        <td><span class="badge badge-payment">${payment}</span></td>
+                        <td class="truncate" title="${(d.title || \'\').replace(/"/g, \'&quot;\')}">${d.title || \'-\'}</td>
+                        <td>${d.vendor || \'-\'}</td>
+                        <td>${(d.date || d.created_at || \'-\').toString().split(\'T\')[0]}</td>
+                        <td><span class="badge badge-blue">${typeLabel}</span></td>
                     </tr>
                 `}).join(\'\');
             } catch (e) {
-                document.getElementById(\'documents-table\').innerHTML = `<tr><td colspan="8" class="error">Error: ${e.message}</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="8" class="error">Error: ${e.message}</td></tr>`;
+            }
+        }
+
+        async function updateDocumentCategory(docId, category) {
+            if (!currentUserId) return;
+            try {
+                const res = await fetch(`/api/documents/${docId}/category`, {
+                    method: \'PATCH\',
+                    headers: { \'Content-Type\': \'application/json\' },
+                    body: JSON.stringify({ expense_category: category })
+                });
+                if (!res.ok) throw new Error(\'Update failed\');
+                loadDocuments();
+            } catch (e) {
+                alert(\'Could not update category: \' + e.message);
             }
         }
 
@@ -1476,14 +1564,17 @@ def dashboard(request: Request):
             event.target.classList.add('active');
             document.getElementById(tab + '-tab').classList.add('active');
 
-            // Load pending documents when switching to pending tab
             if (tab === 'pending') {
                 loadPendingDocuments();
+            }
+            if (tab === 'documents') {
+                loadDocuments();
             }
         }
 
         // Initial load
         loadStats();
+        loadExpenseCategories();
         loadUsers();
         checkCurrentUser();
         loadDocuments();
@@ -1553,20 +1644,28 @@ def dashboard(request: Request):
                     return;
                 }
 
-                listDiv.innerHTML = pendings.map(p => `
+                listDiv.innerHTML = pendings.map(p => {
+                    const ext = p.extracted_data || {};
+                    const amt = ext.amounts && ext.amounts.total != null ? formatINR(Number(ext.amounts.total)) : '—';
+                    const cat = p.expense_category || ext.expense_category || 'Other';
+                    return `
                     <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; cursor: pointer; transition: all 0.2s;" onclick="openReviewModal('${p.token}')">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
                             <div>
                                 <div style="font-weight: 600; margin-bottom: 0.25rem;">${p.file_name || 'Untitled'}</div>
-                                <div style="font-size: 0.875rem; color: #666;">${new Date(p.created_at).toLocaleString()}</div>
+                                <div style="font-size: 0.875rem; color: #666;">
+                                    <span class="badge badge-category">${cat}</span>
+                                    <span class="badge badge-payment" style="margin-left:0.35rem;">${amt}</span>
+                                </div>
+                                <div style="font-size: 0.75rem; color: #999; margin-top:0.25rem;">${new Date(p.created_at).toLocaleString()}</div>
                             </div>
                             <div style="text-align: right;">
-                                <div style="font-size: 0.875rem; color: #666;">Confidence: ${(p.confidence_overall * 100).toFixed(0)}%</div>
+                                <div style="font-size: 0.875rem; color: #666;">Confidence: ${((p.confidence_overall || 0) * 100).toFixed(0)}%</div>
                                 <div style="font-size: 0.75rem; color: #999;">${p.source}</div>
                             </div>
                         </div>
-                    </div>
-                `).join('');
+                    </div>`;
+                }).join('');
             } catch (e) {
                 document.getElementById('pending-list').innerHTML = `<div class="error">Error: ${e.message}</div>`;
             }
@@ -1580,13 +1679,29 @@ def dashboard(request: Request):
                 const pending = await res.json();
 
                 currentPendingData = pending.extracted_data;
+                const ext = pending.extracted_data || {};
+                const paymentVal = (ext.amounts && ext.amounts.total != null) ? ext.amounts.total : '';
+                const currentCat = pending.expense_category || ext.expense_category || 'Other';
+                const catSelectHtml = expenseCategories.map(c =>
+                    `<option value="${c}" ${c === currentCat ? 'selected' : ''}>${c}</option>`
+                ).join('');
 
                 const contentDiv = document.getElementById('review-content');
                 contentDiv.innerHTML = `
                     <div style="margin-bottom: 1rem;">
                         <strong>File:</strong> ${pending.file_name || 'Untitled'}<br>
                         <strong>Type:</strong> ${pending.mime_type || 'Unknown'}<br>
-                        <strong>Confidence:</strong> ${(pending.confidence_overall * 100).toFixed(0)}%
+                        <strong>Confidence:</strong> ${((pending.confidence_overall || 0) * 100).toFixed(0)}%
+                    </div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem;">
+                        <div>
+                            <label style="font-weight:600;display:block;margin-bottom:0.35rem;">Category</label>
+                            <select id="review-category" style="width:100%;padding:0.5rem;border-radius:8px;border:1px solid #e0e0e0;">${catSelectHtml}</select>
+                        </div>
+                        <div>
+                            <label style="font-weight:600;display:block;margin-bottom:0.35rem;">Payment (₹)</label>
+                            <input type="number" id="review-payment" step="0.01" value="${paymentVal}" style="width:100%;padding:0.5rem;border-radius:8px;border:1px solid #e0e0e0;" />
+                        </div>
                     </div>
                     <div style="margin-top: 1rem;">
                         <label style="font-weight: 600; display: block; margin-bottom: 0.5rem;">Extracted Data (JSON):</label>
@@ -1610,8 +1725,20 @@ def dashboard(request: Request):
             if (!currentPendingToken) return;
 
             const jsonEditor = document.getElementById('json-editor');
+            const categoryEl = document.getElementById('review-category');
+            const paymentEl = document.getElementById('review-payment');
             try {
                 const updatedData = JSON.parse(jsonEditor.value);
+                if (categoryEl) {
+                    updatedData.expense_category = categoryEl.value;
+                }
+                if (paymentEl && paymentEl.value !== '') {
+                    if (!updatedData.amounts || typeof updatedData.amounts !== 'object') {
+                        updatedData.amounts = {};
+                    }
+                    updatedData.amounts.total = parseFloat(paymentEl.value);
+                    if (!updatedData.amounts.currency) updatedData.amounts.currency = 'INR';
+                }
 
                 const res = await fetch('/api/pending/update', {
                     method: 'POST',

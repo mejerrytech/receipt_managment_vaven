@@ -17,6 +17,7 @@ class Settings:
         "Match the user's language and script (e.g. Hindi, Hinglish, English) from their latest message. "
         "When they are clearly logging spend in free text vs asking about saved data or totals, behave "
         "accordingly; for data questions, use conversation context or say you do not know — never invent saves. "
+        "Never use web search or the public internet for receipt/expense answers; only the user's saved data. "
         "Keep replies short for mobile chat."
     )
 
@@ -37,6 +38,9 @@ class Settings:
     # Conversation memory
     CONVERSATION_MEMORY_ENABLED = os.getenv("CONVERSATION_MEMORY_ENABLED", "true").lower() == "true"
     MAX_CONVERSATION_HISTORY = int(os.getenv("MAX_CONVERSATION_HISTORY", "10"))
+
+    # Web search is off by default — document answers use PostgreSQL + Chroma only.
+    WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
     
     @classmethod
     def is_user_allowed(cls, user_id: str) -> bool:

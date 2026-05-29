@@ -3,11 +3,11 @@
 import os
 import json
 import logging
-import sqlite3
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 import openai
 import anthropic
+from sqlalchemy import text
 
 load_dotenv()
 
@@ -15,6 +15,7 @@ logger = logging.getLogger("nlp_sql")
 
 # Import vector service for fallback and embeddings
 from shared.vector_service import get_vector_service
+from shared.database import engine, DatabaseService
 
 # Model configuration
 GPT4O_MODEL = "gpt-4o"
@@ -194,7 +195,7 @@ Respond ONLY with valid JSON in this exact format:
             Dict with 'sql', 'explanation', 'is_safe', 'error'
         """
         system_prompt = f"""
-You are an AI assistant that converts natural language questions into safe SQLite SQL queries.
+You are an AI assistant that converts natural language questions into safe PostgreSQL SQL queries.
 
 DATABASE SCHEMA:
 {DB_SCHEMA}
@@ -206,7 +207,7 @@ CRITICAL SECURITY RULES:
 2. NEVER access data of other users
 3. ONLY generate SELECT queries (NO INSERT, UPDATE, DELETE, DROP, ALTER)
 4. "my" always refers to user_id = {user_id}
-5. Return only valid SQLite SQL
+5. Return only valid PostgreSQL SQL
 
 ========================
 UI RESPONSE FORMAT RULES (VERY IMPORTANT):
@@ -294,7 +295,7 @@ Output:
 User: "Show invoices from last month"
 Output:
 {{
-    "sql": "SELECT document_type AS type, title, total_amount AS amount, vendor_name AS vendor, created_at AS date FROM documents WHERE user_id = {user_id} AND document_type LIKE '%invoice%' AND datetime(created_at) >= datetime('now', '-1 month') ORDER BY created_at DESC",
+    "sql": "SELECT document_type AS type, title, total_amount AS amount, vendor_name AS vendor, created_at AS date FROM documents WHERE user_id = {user_id} AND document_type ILIKE '%invoice%' AND created_at >= NOW() - INTERVAL '1 month' ORDER BY created_at DESC",
     "explanation": "Fetches invoice documents from last month",
     "is_safe": true,
     "error": null
@@ -410,36 +411,25 @@ Every query MUST be UI-compatible and follow the exact column structure.
                 "error": f"Failed to generate SQL: {str(e)}"
             }
 
-    def execute_query(self, sql: str, db_path: str = "bot_data.db") -> Dict[str, Any]:
-        """
-        Execute a SQL query and return results.
-
-        Args:
-            sql: The SQL query to execute
-            db_path: Path to SQLite database
-
-        Returns:
-            Dict with 'columns', 'rows', 'row_count', 'error'
-        """
+    def execute_query(self, sql: str) -> Dict[str, Any]:
+        """Execute SQL against PostgreSQL (DATABASE_URL)."""
         try:
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with engine.connect() as conn:
+                result = conn.execute(text(sql))
+                if result.returns_rows:
+                    rows_raw = result.mappings().all()
+                    result_rows = [dict(row) for row in rows_raw]
+                    columns = list(result.keys())
+                else:
+                    result_rows = []
+                    columns = []
 
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-
-            columns = [description[0] for description in cursor.description] if cursor.description else []
-            result_rows = [dict(row) for row in rows]
-
-            conn.close()
-
-            return {
-                "columns": columns,
-                "rows": result_rows,
-                "row_count": len(result_rows),
-                "error": None
-            }
+                return {
+                    "columns": columns,
+                    "rows": result_rows,
+                    "row_count": len(result_rows),
+                    "error": None,
+                }
 
         except Exception as e:
             logger.error(f"Error executing SQL: {e}")
@@ -447,17 +437,16 @@ Every query MUST be UI-compatible and follow the exact column structure.
                 "columns": [],
                 "rows": [],
                 "row_count": 0,
-                "error": str(e)
+                "error": str(e),
             }
 
-    def ask_ai(self, user_query: str, user_id: int, db_path: str = "bot_data.db") -> Dict[str, Any]:
+    def ask_ai(self, user_query: str, user_id: int) -> Dict[str, Any]:
         """
         Complete pipeline: Understand Intent -> Route -> Execute -> Format response.
 
         Args:
             user_query: Natural language question
             user_id: User's database ID for security filtering
-            db_path: Path to database
 
         Returns:
             Complete response with SQL, results, and natural language answer
@@ -510,7 +499,7 @@ Every query MUST be UI-compatible and follow the exact column structure.
         sql = sql_result["sql"]
 
         # Step 2: Execute query
-        exec_result = self.execute_query(sql, db_path)
+        exec_result = self.execute_query(sql)
 
         # FALLBACK: If SQL execution fails OR returns empty results, use vector search
         if exec_result.get("error"):
@@ -743,40 +732,25 @@ Provide a natural language summary of these results that directly answers the us
                     "_score": r["similarity_score"]
                 })
 
-            # Get full documents from SQLite to populate details
             try:
-                conn = sqlite3.connect("bot_data.db")
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
+                doc_ids = [int(r["doc_id"]) for r in results if r.get("doc_id") is not None]
+                doc_details = DatabaseService.fetch_documents_for_vector_enrichment(user_id, doc_ids)
 
-                doc_ids = [r["doc_id"] for r in results]
-                placeholders = ",".join(["?"] * len(doc_ids))
-                cursor.execute(f"""
-                    SELECT id, document_type, title, total_amount, vendor_name, created_at
-                    FROM documents
-                    WHERE id IN ({placeholders}) AND user_id = ?
-                """, (*doc_ids, user_id))
-
-                rows = cursor.fetchall()
-                doc_details = {row["id"]: dict(row) for row in rows}
-                conn.close()
-
-                # Enrich data with ALL document fields dynamically
                 for i, item in enumerate(data):
                     doc_id = results[i]["doc_id"]
-                    if doc_id in doc_details:
-                        d = doc_details[doc_id]
-                        # Copy ALL fields from database record
-                        item.update({k: v for k, v in d.items() if v is not None})
-                        # Ensure standard display fields exist
-                        item["type"] = d.get("document_type") or d.get("type") or "document"
-                        item["title"] = d.get("title") or d.get("file_name") or f"Document {doc_id}"
-                        item["amount"] = d.get("total_amount") or d.get("amount")
-                        item["vendor"] = d.get("vendor_name") or d.get("vendor")
-                        item["date"] = d.get("created_at") or d.get("date") or d.get("document_date")
-                        item["currency"] = d.get("currency")
-                        item["invoice_number"] = d.get("invoice_number")
-                        item["gstin"] = d.get("gstin")
+                    try:
+                        doc_id_int = int(doc_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if doc_id_int not in doc_details:
+                        continue
+                    d = doc_details[doc_id_int]
+                    item.update({k: v for k, v in d.items() if v is not None})
+                    item["type"] = d.get("document_type") or "document"
+                    item["title"] = d.get("title") or f"Document {doc_id_int}"
+                    item["amount"] = d.get("total_amount")
+                    item["vendor"] = d.get("vendor_name")
+                    item["date"] = d.get("created_at") or d.get("document_date")
 
             except Exception as e:
                 logger.warning(f"Could not enrich vector results with DB data: {e}")

@@ -107,6 +107,26 @@ def _compact_ocr_payload_for_summary(extracted_json: str) -> Dict[str, Any]:
     return {"fields": compact_fields, "items": compact_items}
 
 
+def _remember_saved_document_for_qa(user_id: int, extracted_json: str, label: str = "saved document") -> None:
+    """Add the saved OCR payload to NLP context so immediate follow-ups can resolve it."""
+    try:
+        context_payload = _compact_ocr_payload_for_summary(extracted_json)
+        if not context_payload.get("fields") and not context_payload.get("items"):
+            parsed = _safe_json_loads(extracted_json)
+            context_payload = {"extracted_data": parsed} if parsed else {}
+        if not context_payload:
+            return
+
+        context_json = json.dumps(context_payload, ensure_ascii=False, indent=2)
+        nlp_service_v2._add_to_history(
+            user_id,
+            f"Uploaded and saved {label}.",
+            "Saved document context for future questions:\n" + context_json,
+        )
+    except Exception:
+        logger.exception("Failed to add saved document to QA context for user %s", user_id)
+
+
 async def _build_upload_preview_card(extracted_json: str, confidence: float, doc_label: str, file_name: str = "") -> str:
     """
     Build dynamic OCR summary card through GPT.
@@ -250,7 +270,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         " **Telegram Bot is Live!**\n\n"
         "I can help you with:\n"
         "• General questions\n"
-        "• Web search (/websearch)\n"
         "• Conversation memory\n\n"
         "Use /help for available commands.",
         parse_mode="Markdown"
@@ -269,7 +288,6 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help - Show this help message\n"
         "/summary - Get summary of your documents (total docs, amount, vendors)\n"
         "/q <question> - Ask about your documents (e.g., 'show my invoices')\n"
-        "/websearch <query> - Search the web with AI\n"
         "/mydocs - View your uploaded documents\n"
         "/clear - Clear conversation memory\n\n"
         "**Features**\n"
@@ -304,7 +322,14 @@ async def clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def websearch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /websearch command to search the web."""
+    """Handle /websearch command (disabled unless WEB_SEARCH_ENABLED=true)."""
+    if not settings.WEB_SEARCH_ENABLED:
+        await update.message.reply_text(
+            "Web search is disabled. Ask about your uploaded receipts/invoices in normal chat or use /q — "
+            "answers come from your SQL + vector data only."
+        )
+        return
+
     start_time = time.time()
     
     # Check user allowlist
@@ -356,6 +381,77 @@ async def websearch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
 
+async def _answer_user_question(
+    update: Update,
+    db_user,
+    user_text: str,
+    *,
+    log_prefix: str = "query",
+) -> str:
+    """
+    Unified answer path for normal chat and /q: hybrid SQL+vector via NLP v2,
+    shared per-user conversation memory (user_id scoped).
+    """
+    if not db_user:
+        return "Error: Could not identify user."
+
+    is_normal_chat = log_prefix == "normal"
+    expense_decision = (
+        nlp_service_v2.classify_plain_text_expense(user_text)
+        if is_normal_chat
+        else {"should_store": False, "category": "Other", "user_emotion": "neutral"}
+    )
+    if is_normal_chat and expense_decision.get("should_store"):
+        try:
+            entry = db_service.save_user_text_entry(
+                user_id=db_user.id,
+                user_text=user_text,
+                intent_tag="expense_related_message",
+                expense_category=expense_decision.get("category") or "Other",
+            )
+            category = getattr(entry, "expense_category", None) or expense_decision.get("category") or "Other"
+            amount = getattr(entry, "amount", None)
+            amount_part = f" Amount: ₹{amount:,.2f}." if amount is not None else ""
+            answer = f"Saved as {category} expense.{amount_part}"
+            nlp_service_v2._add_to_history(db_user.id, user_text, answer)
+            return answer
+        except Exception:
+            logger.exception("Failed to persist expense text for user %s", db_user.id)
+            return "Expense entry save nahi ho paayi. Please thodi der baad try karein."
+
+    try:
+        result = nlp_service_v2.ask_ai(user_text, db_user.id)
+        answer = (result.get("ai_response") or "").strip()
+        if answer:
+            logger.info(
+                "%s answered via hybrid pipeline (hybrid=%s, fallback=%s)",
+                log_prefix,
+                result.get("hybrid"),
+                result.get("fallback"),
+            )
+            return answer
+    except Exception:
+        logger.exception("%s: NLP v2 pipeline failed", log_prefix)
+
+    # Last resort: general chat with the same NLP conversation history injected.
+    hist = nlp_service_v2._get_conversation_context(db_user.id)
+    prompt = user_text
+    if hist:
+        prompt = f"{hist}\n\nUser: {user_text}"
+    emotion = expense_decision.get("user_emotion") or "neutral"
+    system_prompt = settings.SYSTEM_PROMPT + (
+        f"\n\nReply tone hint: {emotion}. User data is private; never reveal other users' data."
+    )
+    answer = await openai_service.ask(
+        user_prompt=prompt,
+        system_prompt=system_prompt,
+        chat_id=None,
+        use_memory=False,
+    )
+    nlp_service_v2._add_to_history(db_user.id, user_text, answer)
+    return answer
+
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular messages."""
     start_time = time.time()
@@ -375,7 +471,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     user_text = update.message.text.strip()
-    chat_id = str(update.effective_chat.id)
     logger.info("Incoming user message for intent check: '%s'", user_text)
     
     # Show typing indicator
@@ -384,52 +479,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     
     try:
-        # Use conversation memory if enabled
-        use_memory = settings.CONVERSATION_MEMORY_ENABLED
-
-        expense_decision = nlp_service_v2.classify_plain_text_expense(user_text)
-        if db_user and expense_decision.get("should_store"):
-            try:
-                logger.info(
-                    "Message classified as expense-related; saving text entry for user %s category=%s",
-                    db_user.id,
-                    expense_decision.get("category"),
-                )
-                db_service.save_user_text_entry(
-                    user_id=db_user.id,
-                    user_text=user_text,
-                    intent_tag="expense_related_message",
-                    expense_category=expense_decision.get("category"),
-                )
-            except Exception:
-                logger.exception("Failed to persist expense-related user text for user %s", db_user.id)
-
-        emotion = expense_decision.get("user_emotion") or "neutral"
-        system_prompt = settings.SYSTEM_PROMPT
-        system_prompt += (
-            f"\n\nTurn context: classify the user's tone as '{emotion}' for your reply style only "
-            f"(warmer if grateful/positive, calmer if stressed_or_urgent or negative, default if neutral/casual). "
-            f"Do not label their emotion unless they explicitly ask."
-        )
-        if expense_decision.get("should_store"):
-            system_prompt += (
-                "\nThis message was saved as a spending text entry; you may give a very short acknowledgment "
-                f"(category: {expense_decision.get('category')}) if it fits naturally, then stop."
-            )
-
-        answer = await openai_service.ask(
-            user_prompt=user_text,
-            system_prompt=system_prompt,
-            chat_id=chat_id if use_memory else None,
-            use_memory=use_memory
-        )
-        # Send response (chunked if too long)
+        answer = await _answer_user_question(update, db_user, user_text, log_prefix="normal")
         await _reply_in_chunks(update, answer, settings.MAX_MESSAGE_LENGTH)
         
         latency = time.time() - start_time
         logger.info(
-            f"Message processed for user {update.effective_user.id} "
-            f"in {latency:.2f}s (memory: {use_memory})"
+            f"Message processed for user {update.effective_user.id} in {latency:.2f}s"
         )
         
     except Exception:
@@ -864,41 +919,10 @@ async def query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
     try:
-        # Use new NLP SQL v2 service with GPT-4o + Anthropic fallback via orchestrator
-        result = nlp_service_v2.ask_ai(query_text, db_user.id)
-
-        # Format response based on result
-        if result.get("success"):
-            if result.get("fallback"):
-                # Semantic path: one plain summary (LLM already uses DB / extracted_data)
-                data = result.get("data", [])
-                ai_follow = (result.get("ai_response") or "").strip()
-
-                if ai_follow:
-                    await update.message.reply_text(ai_follow[:4096])
-                elif data:
-                    parts = []
-                    for item in data[:3]:
-                        t = item.get("title") or "Document"
-                        v = (item.get("vendor") or "").strip()
-                        parts.append(f"{t}" + (f" ({v})" if v else ""))
-                    await update.message.reply_text(
-                        "Related: " + "; ".join(parts) + "."
-                    )
-                else:
-                    await update.message.reply_text(
-                        "No matching documents found. Try other keywords or upload again."
-                    )
-            else:
-                # SQL + formatter path: plain summary only
-                ai_response = result.get("ai_response")
-                if ai_response:
-                    await update.message.reply_text(str(ai_response)[:4096])
-                else:
-                    await update.message.reply_text("Query ran but no summary was returned.")
-        else:
-            ai_response = result.get("ai_response", "I could not process your query. Try rephrasing.")
-            await update.message.reply_text(str(ai_response)[:4096])
+        answer = await _answer_user_question(
+            update, db_user, query_text, log_prefix="/q"
+        )
+        await _reply_in_chunks(update, answer, settings.MAX_MESSAGE_LENGTH)
 
         latency = time.time() - start_time
         logger.info(f"Query processed for user {db_user.telegram_id}: '{query_text}' in {latency:.2f}s")
@@ -1024,6 +1048,10 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text("❌ Failed to save document. Please try again.")
             return
 
+        indexed = DatabaseService.index_document_in_vector_store(doc)
+        if not indexed:
+            indexed = DatabaseService.reindex_document_vector(doc.id, doc.user_id)
+
         confidence = pending.confidence_overall if pending.confidence_overall is not None else _get_confidence(pending.extracted_data)
         saved_card = await _build_upload_preview_card(
             extracted_json=pending.extracted_data,
@@ -1032,10 +1060,17 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             file_name=pending.file_name or ""
         )
 
+        vector_note = (
+            "\n\n🔎 Indexed in vector DB for semantic search."
+            if indexed
+            else "\n\n⚠️ Saved in SQL but vector indexing failed — /q may miss this document until re-indexed."
+        )
+
         await query.edit_message_text(
-            f"✅ **Document Saved**\n\n{saved_card}",
+            f"✅ **Document Saved** (SQL + vector)\n\n{saved_card}{vector_note}",
             parse_mode="Markdown"
         )
+        _remember_saved_document_for_qa(doc.user_id, pending.extracted_data, pending.file_name or "document")
 
     except Exception:
         logger.exception("Failed to confirm document")
@@ -1107,6 +1142,10 @@ async def edit_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ Failed to save document. Please try again.")
             return
 
+        indexed = DatabaseService.index_document_in_vector_store(doc)
+        if not indexed:
+            indexed = DatabaseService.reindex_document_vector(doc.id, doc.user_id)
+
         corrected_confidence = _get_confidence(corrected_json)
         corrected_card = await _build_upload_preview_card(
             extracted_json=corrected_json,
@@ -1115,10 +1154,17 @@ async def edit_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             file_name=pending.file_name or ""
         )
 
+        vector_note = (
+            "\n\n🔎 Indexed in vector DB."
+            if indexed
+            else "\n\n⚠️ SQL saved; vector index failed."
+        )
+
         await update.message.reply_text(
-            f"✅ **Corrected Document Saved**\n📄 Document ID: `{doc.id}`\n\n{corrected_card}",
+            f"✅ **Corrected Document Saved** (SQL + vector)\n📄 Document ID: `{doc.id}`\n\n{corrected_card}{vector_note}",
             parse_mode="Markdown"
         )
+        _remember_saved_document_for_qa(doc.user_id, corrected_json, pending.file_name or "corrected document")
 
     except json.JSONDecodeError:
         await update.message.reply_text("❌ Invalid JSON format. Please check your input and try again.")

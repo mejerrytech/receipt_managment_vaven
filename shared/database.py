@@ -6,21 +6,29 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-from dotenv import load_dotenv
-
 from sqlalchemy import create_engine, inspect, Column, Integer, String, DateTime, Text, ForeignKey, BigInteger, Float, text, or_
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.sql import func
 
-load_dotenv()
+from shared.env import load_project_dotenv
+
+load_project_dotenv()
 
 logger = logging.getLogger("database")
 
 # Import vector service for ChromaDB integration
 from shared.vector_service import get_vector_service, VectorService
 
-# Database URL from env or default to SQLite
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot_data.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is required. Set it in .env (e.g. New/.env) to a PostgreSQL URL."
+    )
+if DATABASE_URL.strip().lower().startswith("sqlite"):
+    raise RuntimeError(
+        "SQLite is not supported. Set DATABASE_URL to PostgreSQL "
+        "(e.g. postgresql+psycopg2://user:pass@localhost:5432/expence)."
+    )
 
 # Create engine
 engine = create_engine(DATABASE_URL, echo=False, future=True)
@@ -29,17 +37,12 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-def _is_postgresql() -> bool:
-    return engine.dialect.name == "postgresql"
-
-
 def _timestamp_column_type_sql() -> str:
-    """SQLite uses DATETIME; PostgreSQL should use a proper timestamp type."""
-    return "TIMESTAMP WITH TIME ZONE" if _is_postgresql() else "DATETIME"
+    return "TIMESTAMP WITH TIME ZONE"
 
 
 def _table_column_names(table_name: str) -> set:
-    """Return lowercase column names for SQLite / PostgreSQL (no PRAGMA — works on both)."""
+    """Return lowercase column names via SQLAlchemy inspector."""
     try:
         insp = inspect(engine)
         if not insp.has_table(table_name):
@@ -174,6 +177,7 @@ class PendingDocument(Base):
     # OCR extracted data (stored as JSON string)
     extracted_data = Column(Text, nullable=True)
     user_input_text = Column(Text, nullable=True)
+    expense_category = Column(String(50), nullable=True)
     
     # Confidence score
     confidence_overall = Column(Float, nullable=True)
@@ -213,6 +217,7 @@ class PendingDocument(Base):
             "file_size": self.file_size,
             "extracted_data": json.loads(self.extracted_data) if self.extracted_data else None,
             "user_input_text": self.user_input_text,
+            "expense_category": self.expense_category,
             "confidence_overall": self.confidence_overall,
             "telegram_chat_id": self.telegram_chat_id,
             "telegram_message_id": self.telegram_message_id,
@@ -279,12 +284,14 @@ def init_db():
     _ensure_expense_category_columns()
     _ensure_user_input_text_columns()
     _ensure_user_text_entry_amount_columns()
+    _normalize_existing_expense_categories()
     _seed_telegram_q_prompts()
+    _migrate_prompts_from_sqlite_wording()
     logger.info("Database initialized successfully")
 
 
 def _ensure_hash_columns():
-    """Lightweight migration to add hash columns on existing tables (SQLite + PostgreSQL)."""
+    """Lightweight migration to add hash columns on existing tables."""
     with engine.connect() as conn:
         for table in ("documents", "pending_documents"):
             cols = _table_column_names(table)
@@ -320,11 +327,14 @@ def _ensure_pending_queue_columns():
 
 
 def _ensure_expense_category_columns():
-    """Add expense_category column on documents for existing DBs."""
+    """Add expense_category column on documents and pending_documents for existing DBs."""
     with engine.connect() as conn:
-        cols = _table_column_names("documents")
-        if "expense_category" not in cols:
+        doc_cols = _table_column_names("documents")
+        if "expense_category" not in doc_cols:
             conn.execute(text("ALTER TABLE documents ADD COLUMN expense_category VARCHAR(50)"))
+        pending_cols = _table_column_names("pending_documents")
+        if "expense_category" not in pending_cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN expense_category VARCHAR(50)"))
         conn.commit()
 
 
@@ -353,6 +363,95 @@ def _ensure_user_text_entry_amount_columns():
         if "currency" not in cols:
             conn.execute(text("ALTER TABLE user_text_entries ADD COLUMN currency VARCHAR(10)"))
         conn.commit()
+
+
+def _normalize_existing_expense_categories() -> None:
+    """Normalize legacy/invalid expense_category values to canonical list or Other."""
+    valid = set(DatabaseService.EXPENSE_CATEGORIES)
+    with engine.begin() as conn:
+        docs = conn.execute(
+            text("SELECT id, expense_category FROM documents WHERE expense_category IS NOT NULL")
+        ).mappings().all()
+        for row in docs:
+            normalized = DatabaseService.normalize_expense_category_label(row["expense_category"])
+            if normalized != row["expense_category"] or normalized not in valid:
+                conn.execute(
+                    text("UPDATE documents SET expense_category = :c WHERE id = :id"),
+                    {"c": normalized if normalized in valid else "Other", "id": row["id"]},
+                )
+
+        pending = conn.execute(
+            text("SELECT id, expense_category FROM pending_documents WHERE expense_category IS NOT NULL")
+        ).mappings().all()
+        for row in pending:
+            normalized = DatabaseService.normalize_expense_category_label(row["expense_category"])
+            if normalized != row["expense_category"] or normalized not in valid:
+                conn.execute(
+                    text("UPDATE pending_documents SET expense_category = :c WHERE id = :id"),
+                    {"c": normalized if normalized in valid else "Other", "id": row["id"]},
+                )
+
+        text_rows = conn.execute(
+            text("SELECT id, expense_category FROM user_text_entries WHERE expense_category IS NOT NULL")
+        ).mappings().all()
+        for row in text_rows:
+            normalized = DatabaseService.normalize_expense_category_label(row["expense_category"])
+            if normalized != row["expense_category"] or normalized not in valid:
+                conn.execute(
+                    text("UPDATE user_text_entries SET expense_category = :c WHERE id = :id"),
+                    {"c": normalized if normalized in valid else "Other", "id": row["id"]},
+                )
+
+
+def _migrate_prompts_from_sqlite_wording() -> None:
+    """Replace DB prompt rows that still reference SQLite with PostgreSQL seed content."""
+    try:
+        from shared.telegram_q_prompt_seed import load_telegram_q_seed_rows
+    except ImportError:
+        return
+    rows = load_telegram_q_seed_rows()
+    if not rows:
+        return
+    try:
+        updated = 0
+        with engine.begin() as conn:
+            for r in rows:
+                pk = r.get("prompt_key")
+                if not pk:
+                    continue
+                existing = conn.execute(
+                    text("SELECT system_prompt FROM prompts WHERE prompt_key = :k"),
+                    {"k": pk},
+                ).scalar()
+                if not existing or "sqlite" not in str(existing).lower():
+                    continue
+                conn.execute(
+                    text(
+                        """
+                        UPDATE prompts
+                        SET system_prompt = :sp,
+                            user_prompt_template = :upt,
+                            updated_at = NOW()
+                        WHERE prompt_key = :pk
+                        """
+                    ),
+                    {
+                        "sp": r.get("system_prompt") or "",
+                        "upt": r.get("user_prompt_template"),
+                        "pk": pk,
+                    },
+                )
+                updated += 1
+        if updated:
+            logger.info("Migrated %s prompt(s) from SQLite to PostgreSQL wording", updated)
+            try:
+                from shared.nlp_sql_service_v2 import invalidate_telegram_q_prompt_cache
+
+                invalidate_telegram_q_prompt_cache()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("Prompt SQLite->PostgreSQL migration skipped: %s", e)
 
 
 def _seed_telegram_q_prompts() -> None:
@@ -448,11 +547,154 @@ class DatabaseService:
         _merged_input_text: Optional[str],
         _file_name: Optional[str],
     ) -> str:
-        """Category comes only from OCR JSON `expense_category` (normalized); no keyword tables."""
+        """Category from OCR JSON `expense_category` (normalized)."""
         ocr_raw = data.get("expense_category")
         if isinstance(ocr_raw, str):
             return DatabaseService.normalize_expense_category_label(ocr_raw.strip())
         return DatabaseService.normalize_expense_category_label(None)
+
+    @staticmethod
+    def _infer_document_expense_category(
+        data: dict,
+        merged_input_text: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> str:
+        """Resolve category from OCR JSON; LLM fallback when still Other."""
+        category = DatabaseService._resolve_document_expense_category(
+            data, merged_input_text, file_name
+        )
+        if category != "Other":
+            return category
+
+        amounts = data.get("amounts") if isinstance(data.get("amounts"), dict) else {}
+        vendor = data.get("vendor_or_sender") if isinstance(data.get("vendor_or_sender"), dict) else {}
+        hint_parts = [
+            merged_input_text,
+            data.get("title"),
+            data.get("document_type"),
+            vendor.get("name"),
+            file_name,
+        ]
+        if amounts.get("total"):
+            hint_parts.append(f"paid {amounts.get('total')} {amounts.get('currency') or 'INR'}")
+        hint = " ".join(str(p) for p in hint_parts if p).strip()
+        if not hint:
+            return "Other"
+
+        try:
+            from shared.nlp_sql_service_v2 import get_nlp_sql_service_v2
+
+            decision = get_nlp_sql_service_v2().classify_plain_text_expense(hint)
+            if decision.get("category"):
+                return DatabaseService.normalize_expense_category_label(decision["category"])
+        except Exception as e:
+            logger.warning("LLM category fallback failed: %s", e)
+        return "Other"
+
+    @staticmethod
+    def list_expense_categories() -> List[str]:
+        return list(DatabaseService.EXPENSE_CATEGORIES)
+
+    @staticmethod
+    def get_user_expense_items(
+        user_id: int,
+        category: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Unified expense rows from documents + manual text entries (for UI)."""
+        db = get_db()
+        try:
+            items: List[Dict[str, Any]] = []
+            docs = (
+                db.query(Document)
+                .filter(Document.user_id == user_id)
+                .order_by(Document.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            for doc in docs:
+                cat = DatabaseService.normalize_expense_category_label(doc.expense_category)
+                items.append({
+                    "source": "document",
+                    "id": doc.id,
+                    "expense_category": cat,
+                    "payment": doc.total_amount,
+                    "currency": doc.currency or "INR",
+                    "title": doc.title or doc.file_name or "Document",
+                    "vendor": doc.vendor_name,
+                    "document_type": doc.document_type,
+                    "date": doc.document_date or (
+                        doc.created_at.isoformat() if doc.created_at else None
+                    ),
+                    "created_at": doc.created_at.isoformat() if doc.created_at else None,
+                })
+
+            texts = (
+                db.query(UserTextEntry)
+                .filter(UserTextEntry.user_id == user_id)
+                .order_by(UserTextEntry.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            for entry in texts:
+                cat = DatabaseService.normalize_expense_category_label(entry.expense_category)
+                items.append({
+                    "source": "text",
+                    "id": entry.id,
+                    "expense_category": cat,
+                    "payment": entry.amount,
+                    "currency": entry.currency or "INR",
+                    "title": (entry.text or "")[:120],
+                    "vendor": None,
+                    "document_type": "text_entry",
+                    "date": entry.created_at.isoformat() if entry.created_at else None,
+                    "created_at": entry.created_at.isoformat() if entry.created_at else None,
+                })
+
+            if category:
+                norm = DatabaseService.normalize_expense_category_label(category)
+                items = [i for i in items if i["expense_category"] == norm]
+
+            items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+            return items[:limit]
+        finally:
+            db.close()
+
+    @staticmethod
+    def update_document_expense_category(
+        doc_id: int, user_id: int, expense_category: str
+    ) -> Optional[Document]:
+        """Update category on a saved document and refresh vector metadata."""
+        db = get_db()
+        try:
+            doc = (
+                db.query(Document)
+                .filter(Document.id == doc_id, Document.user_id == user_id)
+                .first()
+            )
+            if not doc:
+                return None
+            doc.expense_category = DatabaseService.normalize_expense_category_label(
+                expense_category
+            )
+            if doc.extracted_data:
+                try:
+                    data = json.loads(doc.extracted_data)
+                    if isinstance(data, dict):
+                        data["expense_category"] = doc.expense_category
+                        doc.extracted_data = json.dumps(data, ensure_ascii=False)
+                except Exception:
+                    pass
+            db.commit()
+            db.refresh(doc)
+            DatabaseService.index_document_in_vector_store(doc)
+            return doc
+        except Exception as e:
+            db.rollback()
+            logger.error("update_document_expense_category failed: %s", e)
+            raise
+        finally:
+            db.close()
 
     @staticmethod
     def _extract_amount_from_text(user_text: str) -> Optional[float]:
@@ -514,6 +756,15 @@ class DatabaseService:
             db.close()
 
     @staticmethod
+    def get_user_by_id(user_id: int) -> Optional[User]:
+        """Fetch user by internal users.id."""
+        db = get_db()
+        try:
+            return db.query(User).filter(User.id == user_id).first()
+        finally:
+            db.close()
+
+    @staticmethod
     def save_document(user_id: int, file_name: Optional[str], mime_type: Optional[str],
                       file_size: Optional[int], extracted_json: str,
                       raw_text: Optional[str] = None,
@@ -537,9 +788,11 @@ class DatabaseService:
             identifiers = data.get("identifiers", {})
             confidence = data.get("confidence", {})
             merged_input_text = " ".join([x for x in [raw_text, user_input_text] if x]).strip() or None
-            classified_category = DatabaseService._resolve_document_expense_category(
+            classified_category = DatabaseService._infer_document_expense_category(
                 data, merged_input_text, file_name
             )
+            data["expense_category"] = classified_category
+            stored_json = json.dumps(data, ensure_ascii=False) if data else extracted_json
 
             doc = Document(
                 user_id=user_id,
@@ -550,7 +803,7 @@ class DatabaseService:
                 content_sha256=content_sha256,
                 dhash=dhash,
                 phash=phash,
-                extracted_data=extracted_json,
+                extracted_data=stored_json,
                 document_type=data.get("document_type"),
                 title=data.get("title"),
                 document_date=data.get("date"),
@@ -710,11 +963,33 @@ class DatabaseService:
             if not cleaned:
                 return None
             cat_candidate = (expense_category or "").strip()
-            if cat_candidate in DatabaseService.EXPENSE_CATEGORIES:
-                category = cat_candidate
+            if cat_candidate:
+                category = DatabaseService.normalize_expense_category_label(cat_candidate)
             else:
-                category = DatabaseService.normalize_expense_category_label(cat_candidate or None)
+                category = DatabaseService._infer_document_expense_category(
+                    {"title": cleaned}, merged_input_text=cleaned, file_name=None
+                )
             amount = DatabaseService._extract_amount_from_text(cleaned)
+            duplicate_after = datetime.now(timezone.utc) - timedelta(minutes=15)
+            duplicate = (
+                db.query(UserTextEntry)
+                .filter(UserTextEntry.user_id == user_id)
+                .filter(func.lower(UserTextEntry.text) == cleaned.lower())
+                .filter(UserTextEntry.expense_category == category)
+                .filter(UserTextEntry.amount == amount)
+                .filter(UserTextEntry.created_at >= duplicate_after)
+                .order_by(UserTextEntry.created_at.desc())
+                .first()
+            )
+            if duplicate:
+                logger.info(
+                    "Skipped duplicate user text entry: id=%s, user_id=%s, category=%s",
+                    duplicate.id,
+                    user_id,
+                    category,
+                )
+                return duplicate
+
             entry = UserTextEntry(
                 user_id=user_id,
                 text=cleaned,
@@ -763,7 +1038,7 @@ class DatabaseService:
 
     @staticmethod
     def fetch_documents_for_vector_enrichment(user_id: int, doc_ids: List[int]) -> Dict[int, Dict[str, Any]]:
-        """Batch-load documents for semantic / vector search enrichment (Postgres or SQLite)."""
+        """Batch-load documents for semantic / vector search enrichment."""
         if not doc_ids:
             return {}
         db = get_db()
@@ -910,6 +1185,20 @@ class DatabaseService:
             
             # Set expiration to 24 hours from now
             expires_at = datetime.utcnow() + timedelta(hours=24)
+
+            try:
+                parsed = json.loads(extracted_json) if extracted_json else {}
+            except Exception:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+            pending_category = DatabaseService._infer_document_expense_category(
+                parsed,
+                merged_input_text=user_input_text,
+                file_name=file_name,
+            )
+            parsed["expense_category"] = pending_category
+            extracted_json = json.dumps(parsed, ensure_ascii=False)
             
             pending = PendingDocument(
                 user_id=user_id,
@@ -924,6 +1213,7 @@ class DatabaseService:
                 phash=phash,
                 extracted_data=extracted_json,
                 user_input_text=user_input_text,
+                expense_category=pending_category,
                 confidence_overall=confidence_overall,
                 telegram_chat_id=telegram_chat_id,
                 telegram_message_id=telegram_message_id,
@@ -1050,6 +1340,19 @@ class DatabaseService:
                 return None
             
             pending.extracted_data = updated_json
+            try:
+                parsed = json.loads(updated_json) if updated_json else {}
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, dict):
+                cat = DatabaseService._infer_document_expense_category(
+                    parsed,
+                    merged_input_text=pending.user_input_text,
+                    file_name=pending.file_name,
+                )
+                parsed["expense_category"] = cat
+                pending.expense_category = cat
+                pending.extracted_data = json.dumps(parsed, ensure_ascii=False)
             db.commit()
             db.refresh(pending)
             
@@ -1120,7 +1423,21 @@ class DatabaseService:
             pending = db.query(PendingDocument).filter(PendingDocument.id == pending_id).first()
             if not pending or pending.status in ('confirmed', 'cancelled'):
                 return None
-            pending.extracted_data = extracted_json
+            parsed: Dict[str, Any]
+            try:
+                parsed = json.loads(extracted_json) if extracted_json else {}
+            except Exception:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+            category = DatabaseService._infer_document_expense_category(
+                parsed,
+                merged_input_text=pending.user_input_text,
+                file_name=pending.file_name,
+            )
+            parsed["expense_category"] = category
+            pending.extracted_data = json.dumps(parsed, ensure_ascii=False)
+            pending.expense_category = category
             pending.confidence_overall = confidence_overall
             pending.status = 'ready'
             pending.error_message = None
@@ -1507,5 +1824,8 @@ class DatabaseService:
         return bool(changed)
 
 
-# Initialize database on module import
-init_db()
+# Initialize database on import when PostgreSQL is reachable (web_admin also calls init_db on startup)
+try:
+    init_db()
+except Exception as e:
+    logger.warning("Database init on import failed (will retry on app startup): %s", e)

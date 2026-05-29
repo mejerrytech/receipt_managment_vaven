@@ -10,12 +10,12 @@ This service provides:
 import os
 import json
 import logging
-import sqlite3
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 
 from shared.orchestrator import get_orchestrator, AgentType, ModelProvider
 from shared.vector_service import get_vector_service
+from shared.database import DatabaseService
 
 load_dotenv()
 
@@ -106,7 +106,6 @@ class RAGService:
         user_query: str,
         user_id: int,
         n_results: int = 5,
-        db_path: str = "bot_data.db"
     ) -> Dict[str, Any]:
         """
         Answer a user question using RAG approach.
@@ -128,7 +127,7 @@ class RAGService:
             }
 
         # Step 2: Enrich documents with full details
-        enriched_docs = self._enrich_documents(retrieved_docs, user_id, db_path)
+        enriched_docs = self._enrich_documents(retrieved_docs, user_id)
 
         # Step 3: Generate answer using GPT-4o with function calling
         answer_result = self._generate_answer(user_query, enriched_docs)
@@ -166,40 +165,39 @@ class RAGService:
         self,
         docs: List[Dict],
         user_id: int,
-        db_path: str
     ) -> List[Dict[str, Any]]:
-        """Enrich vector search results with full DB details."""
+        """Enrich vector search results with full DB details from PostgreSQL."""
         try:
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-
-            doc_ids = [d["doc_id"] for d in docs]
-            placeholders = ",".join(["?"] * len(doc_ids))
-
-            cursor.execute(f"""
-                SELECT id, document_type, title, total_amount, vendor_name,
-                       invoice_number, currency, document_date, created_at,
-                       extracted_data, file_name, gstin
-                FROM documents
-                WHERE id IN ({placeholders}) AND user_id = ?
-            """, (*doc_ids, user_id))
-
-            rows = cursor.fetchall()
-            doc_details = {row["id"]: dict(row) for row in rows}
-            conn.close()
+            doc_ids = [int(d["doc_id"]) for d in docs if d.get("doc_id") is not None]
+            raw_details = DatabaseService.fetch_documents_for_vector_enrichment(user_id, doc_ids)
+            doc_details = {}
+            for doc_id, row in raw_details.items():
+                doc_details[doc_id] = {
+                    "id": doc_id,
+                    "document_type": row.get("document_type"),
+                    "title": row.get("title"),
+                    "total_amount": row.get("total_amount"),
+                    "vendor_name": row.get("vendor_name"),
+                    "document_date": row.get("document_date"),
+                    "created_at": row.get("created_at"),
+                    "extracted_data": row.get("extracted_data"),
+                }
 
             enriched = []
             for doc in docs:
                 doc_id = doc["doc_id"]
+                try:
+                    doc_id_key = int(doc_id)
+                except (TypeError, ValueError):
+                    doc_id_key = doc_id
                 enriched_doc = {
                     "doc_id": doc_id,
                     "similarity_score": doc.get("similarity_score", 0),
                     "text_preview": doc.get("text", "")[:500]
                 }
 
-                if doc_id in doc_details:
-                    details = doc_details[doc_id]
+                if doc_id_key in doc_details:
+                    details = doc_details[doc_id_key]
                     enriched_doc.update({
                         "title": details.get("title") or details.get("file_name"),
                         "type": details.get("document_type"),
@@ -350,7 +348,6 @@ Use the answer_question function to provide your response."""
         self,
         topic: str,
         user_id: int,
-        db_path: str = "bot_data.db"
     ) -> Dict[str, Any]:
         """
         Search for documents about a topic and provide a summary.
@@ -359,7 +356,6 @@ Use the answer_question function to provide your response."""
             user_query=f"Tell me about {topic}",
             user_id=user_id,
             n_results=10,
-            db_path=db_path
         )
 
         if not result["success"]:
