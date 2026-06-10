@@ -292,6 +292,7 @@ def init_db():
     _normalize_existing_expense_categories()
     _seed_telegram_q_prompts()
     _migrate_prompts_from_sqlite_wording()
+    _migrate_prompt_emoji_rules()
     logger.info("Database initialized successfully")
 
 
@@ -472,6 +473,90 @@ def _migrate_prompts_from_sqlite_wording() -> None:
                 pass
     except Exception as e:
         logger.warning("Prompt SQLite->PostgreSQL migration skipped: %s", e)
+
+
+def _migrate_prompt_emoji_rules() -> None:
+    """
+    Overwrite the four response-formatting prompts with the latest emoji-rule version
+    from the seed JSON. Runs every startup but only writes when content has changed,
+    so it is safe to call repeatedly (idempotent on stable content).
+
+    Prompts updated:
+      - q_expense_save_confirm        (save confirmation — item-level emoji)
+      - q_telegram_format_sql_response (SQL result formatter)
+      - q_telegram_vector_semantic     (vector/semantic answer formatter)
+      - q_telegram_social_reply        (greeting / small-talk)
+    """
+    EMOJI_RULE_KEYS = {
+        "q_expense_save_confirm",
+        "q_telegram_format_sql_response",
+        "q_telegram_vector_semantic",
+        "q_telegram_social_reply",
+    }
+    try:
+        from shared.telegram_q_prompt_seed import load_telegram_q_seed_rows
+    except ImportError:
+        logger.warning("telegram_q_prompt_seed not available; skipping emoji-rule migration")
+        return
+    rows = load_telegram_q_seed_rows()
+    if not rows:
+        return
+    seed_map = {r["prompt_key"]: r for r in rows if r.get("prompt_key") in EMOJI_RULE_KEYS}
+    if not seed_map:
+        return
+    try:
+        updated = 0
+        with engine.begin() as conn:
+            for pk, r in seed_map.items():
+                new_sp = r.get("system_prompt") or ""
+                new_upt = r.get("user_prompt_template")
+                existing = conn.execute(
+                    text("SELECT system_prompt FROM prompts WHERE prompt_key = :k"),
+                    {"k": pk},
+                ).scalar()
+                if existing is None:
+                    # Row not yet seeded — insert it
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO prompts (prompt_key, label, category, system_prompt, user_prompt_template)
+                            VALUES (:pk, :label, :cat, :sp, :upt)
+                            """
+                        ),
+                        {
+                            "pk": pk,
+                            "label": r.get("label") or pk,
+                            "cat": r.get("category") or "telegram_q",
+                            "sp": new_sp,
+                            "upt": new_upt,
+                        },
+                    )
+                    updated += 1
+                elif existing != new_sp:
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE prompts
+                            SET system_prompt = :sp,
+                                user_prompt_template = :upt,
+                                updated_at = NOW()
+                            WHERE prompt_key = :pk
+                            """
+                        ),
+                        {"sp": new_sp, "upt": new_upt, "pk": pk},
+                    )
+                    updated += 1
+        if updated:
+            logger.info("emoji-rule migration: updated %s prompt(s)", updated)
+            try:
+                from shared.nlp_sql_service_v2 import invalidate_telegram_q_prompt_cache
+                invalidate_telegram_q_prompt_cache()
+            except Exception:
+                pass
+        else:
+            logger.debug("emoji-rule migration: all prompts already up-to-date")
+    except Exception as e:
+        logger.warning("emoji-rule prompt migration skipped: %s", e)
 
 
 def _seed_telegram_q_prompts() -> None:
