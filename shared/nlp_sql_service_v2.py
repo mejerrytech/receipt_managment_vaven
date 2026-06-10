@@ -46,6 +46,39 @@ def _parse_extracted_json_column(raw: Any) -> Any:
     return None
 
 
+def _extract_json_object_from_text(content: str) -> Optional[Dict[str, Any]]:
+    """Extract a JSON object from model content that may include markdown or prose."""
+    text_content = (content or "").strip()
+    if not text_content:
+        return None
+
+    if "```json" in text_content:
+        text_content = text_content.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in text_content:
+        text_content = text_content.split("```", 1)[1].split("```", 1)[0].strip()
+
+    try:
+        parsed = json.loads(text_content)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    start = text_content.find("{")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        parsed, _ = decoder.raw_decode(text_content[start:])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _sql_literal(value: str) -> str:
+    """Return a single-quoted SQL literal for prompt/guardrail text."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _rows_for_llm(filtered_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """LLM context from DB only (user-scoped rows): columns + full extracted_data JSON."""
     rows: List[Dict[str, Any]] = []
@@ -179,6 +212,72 @@ CLASSIFY_SUMMARY_ROUTING_FUNCTION = {
         },
         "required": ["use_global_summary_sql", "reason", "confidence"]
     }
+}
+
+# Function schema for parsing multiple expense items from a paragraph
+CLASSIFY_MULTI_ITEM_EXPENSE_FUNCTION = {
+    "name": "classify_multi_item_expense",
+    "description": (
+        "Parse a user paragraph that describes multiple purchases/expenses in one message. "
+        "Extract every individual item with its amount and category. "
+        "Also detect the overall emotional tone. "
+        "Return is_multi_item=false if the message is a single expense or not an expense at all."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "is_multi_item": {
+                "type": "boolean",
+                "description": (
+                    "True when the message clearly contains 2+ distinct expense items that "
+                    "should each be stored as a separate entry."
+                ),
+            },
+            "items": {
+                "type": "array",
+                "description": "List of individual expense items extracted from the paragraph.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "Short natural-language label for this item (e.g. 'Petrol', 'Milk from KL Reliance')",
+                        },
+                        "amount": {
+                            "type": "number",
+                            "description": "Numeric amount in rupees. null if not mentioned.",
+                        },
+                        "quantity": {
+                            "type": "string",
+                            "description": "Quantity or unit if mentioned (e.g. '3 kilo', '2 litre'). null otherwise.",
+                        },
+                        "vendor": {
+                            "type": "string",
+                            "description": "Vendor / shop name if mentioned. null otherwise.",
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": (
+                                "Must be exactly one string from the allowed category list "
+                                "provided in the system prompt."
+                            ),
+                        },
+                    },
+                    "required": ["description", "amount", "category"],
+                },
+            },
+            "user_emotion": {
+                "type": "string",
+                "enum": ["neutral", "positive", "negative", "stressed_or_urgent", "grateful", "casual"],
+                "description": "Overall emotional tone of the message for reply styling.",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence 0-1 that this is a multi-item expense paragraph.",
+            },
+        },
+        "required": ["is_multi_item", "items", "user_emotion", "confidence"],
+    },
 }
 
 # Function schema for deciding whether plain user text should be stored
@@ -658,6 +757,192 @@ Runtime rule:
         """Map model output to a canonical category from DatabaseService.EXPENSE_CATEGORIES."""
         return DatabaseService.normalize_expense_category_label(raw)
 
+    def generate_expense_save_confirmation(
+        self,
+        saved_items: List[Dict[str, Any]],
+        user_emotion: str = "neutral",
+        user_id: Optional[int] = None,
+    ) -> str:
+        """
+        Generate a friendly, emoji-rich confirmation message after saving expense entries.
+        Works for both single-item and multi-item saves.
+        Emoji placement rules are fully driven by the DB prompt — no static formatting here.
+        Falls back to a simple plain string only if the AI call fails.
+        """
+        if not saved_items:
+            return "Koi expense save nahi hua."
+
+        emotion = user_emotion or "neutral"
+        total = sum(
+            float(it.get("amount") or 0) for it in saved_items if it.get("amount") is not None
+        )
+        total_str = f"₹{total:,.0f}" if total > 0 else "N/A"
+
+        sys_t, usr_t = self._q_tpl_pair("q_expense_save_confirm")
+        if not sys_t:
+            # Prompt not yet in DB — return a simple fallback
+            if len(saved_items) == 1:
+                it = saved_items[0]
+                amt = it.get("amount")
+                cat = it.get("category") or "Other"
+                amt_str = f" ₹{float(amt):,.0f}" if amt is not None else ""
+                return f"{cat} expense{amt_str} saved ✅"
+            return f"{len(saved_items)} expenses saved ✅ — Total: {total_str}"
+
+        items_json = json.dumps(saved_items, ensure_ascii=False)
+        user_message = self._render_q_user_template(
+            usr_t,
+            user_emotion=emotion,
+            saved_items=items_json,
+            total_amount=total_str,
+        )
+
+        result = self.orchestrator.execute_with_fallback(
+            system_prompt=sys_t,
+            user_message=user_message,
+            functions=[],
+            temperature=0.6,
+            max_tokens=400,
+        )
+
+        if result.success and result.data and result.data.get("content"):
+            return result.data["content"].strip()
+
+        # Plain fallback if AI unavailable
+        if len(saved_items) == 1:
+            it = saved_items[0]
+            amt = it.get("amount")
+            cat = it.get("category") or "Other"
+            amt_str = f" ₹{float(amt):,.0f}" if amt is not None else ""
+            return f"{cat} expense{amt_str} saved ✅"
+        return f"{len(saved_items)} expenses saved ✅ — Total: {total_str}"
+
+    def classify_multi_item_expense(self, user_text: str) -> Dict[str, Any]:
+        """
+        Detect whether a plain user message describes multiple distinct expense items
+        (e.g. a shopping paragraph). If yes, return each item with its amount and category
+        so the caller can persist and display them individually.
+
+        Returns a dict:
+        {
+            "is_multi_item": bool,
+            "items": [{"description", "amount", "quantity", "vendor", "category"}, ...],
+            "user_emotion": str,
+            "confidence": float,
+        }
+        On any failure returns is_multi_item=False so caller falls back gracefully.
+        """
+        text = (user_text or "").strip()
+        default = {
+            "is_multi_item": False,
+            "items": [],
+            "user_emotion": "neutral",
+            "confidence": 0.0,
+        }
+        if not text:
+            return default
+
+        category_lines = "\n".join(f"- {c}" for c in self.expense_categories)
+        system_prompt = f"""You are an expense-extraction assistant for a receipt/expense bot.
+
+A user can send a single paragraph describing MULTIPLE purchases made in one go, for example:
+"Maine 2000 ka petrol dalwaya. Maine KL Reliance se 66 ka milk, 140 ka tel, 238 ke aam liye."
+
+ALLOWED expense categories (use the EXACT string from this list):
+{category_lines}
+
+Your tasks:
+1. Decide if the message contains 2 or more DISTINCT expense items (is_multi_item).
+   - A single purchase like "Maine 500 ka petrol dalwaya" → is_multi_item = false.
+   - Two or more purchases in one message → is_multi_item = true.
+2. For each item extract:
+   - description  : short label in the user's language (Hindi/English/Hinglish OK)
+   - amount       : numeric rupee value (null if not stated)
+   - quantity     : quantity/unit if mentioned, otherwise null
+   - vendor       : shop/brand/vendor name if mentioned, otherwise null
+   - category     : pick the single best category from the ALLOWED list above
+3. user_emotion   : overall tone of the whole message
+4. confidence     : how confident you are this is a multi-item expense paragraph (0–1)
+
+Critical rules:
+- NEVER invent items or amounts not present in the text.
+- If is_multi_item is false, items can be empty [].
+- category MUST be one of the allowed strings exactly (use 'Other' if uncertain).
+- Understand intent — do NOT rely on commas or conjunctions alone; understand what the user is saying.
+- Call classify_multi_item_expense only."""
+
+        user_message = f"""User message:
+\"\"\"{text}\"\"\"
+
+Parse now."""
+
+        try:
+            result = self.orchestrator.execute_with_fallback(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                functions=[CLASSIFY_MULTI_ITEM_EXPENSE_FUNCTION],
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            if result.success and result.function_calls:
+                func_call = result.function_calls[0]
+                args = func_call.get("arguments", {})
+                if isinstance(args, str):
+                    args = json.loads(args)
+
+                is_multi = bool(args.get("is_multi_item", False))
+                confidence = float(args.get("confidence", 0.0) or 0.0)
+                emotion = args.get("user_emotion") or "neutral"
+                if emotion not in (
+                    "neutral", "positive", "negative",
+                    "stressed_or_urgent", "grateful", "casual",
+                ):
+                    emotion = "neutral"
+
+                # Only trust multi-item with reasonable confidence
+                if not is_multi or confidence < 0.55:
+                    return {**default, "user_emotion": emotion, "confidence": confidence}
+
+                raw_items = args.get("items") or []
+                items: List[Dict[str, Any]] = []
+                for it in raw_items:
+                    if not isinstance(it, dict):
+                        continue
+                    desc = (it.get("description") or "").strip()
+                    if not desc:
+                        continue
+                    amt_raw = it.get("amount")
+                    try:
+                        amt = float(amt_raw) if amt_raw is not None else None
+                    except (TypeError, ValueError):
+                        amt = None
+                    cat = self._normalize_expense_category_label(it.get("category"))
+                    items.append({
+                        "description": desc,
+                        "amount": amt,
+                        "quantity": (it.get("quantity") or "").strip() or None,
+                        "vendor": (it.get("vendor") or "").strip() or None,
+                        "category": cat,
+                    })
+
+                if len(items) < 2:
+                    # Fewer than 2 valid items → not really multi-item
+                    return {**default, "user_emotion": emotion, "confidence": confidence}
+
+                logger.info(
+                    "Multi-item expense detected: %d items, confidence=%.2f", len(items), confidence
+                )
+                return {
+                    "is_multi_item": True,
+                    "items": items,
+                    "user_emotion": emotion,
+                    "confidence": confidence,
+                }
+        except Exception:
+            logger.exception("Multi-item expense classifier failed; falling back to single-item path")
+
+        return default
+
     def classify_plain_text_expense(self, user_text: str) -> Dict[str, Any]:
         """
         Classify a plain Telegram message: expense vs non-expense, exact category (if expense),
@@ -742,15 +1027,65 @@ Classify now."""
         """Backward-compatible: true if plain text should be persisted as an expense entry."""
         return bool(self.classify_plain_text_expense(user_text).get("should_store"))
 
+    def _guardrail_username(self, user_id: int) -> str:
+        """Return the stored username for the current DB user, or a stable internal fallback."""
+        try:
+            user = DatabaseService.get_user_by_id(user_id)
+            username = (getattr(user, "username", None) or "").strip() if user else ""
+            return username or f"user_id:{user_id}"
+        except Exception:
+            logger.exception("Could not load username guardrail for user_id=%s", user_id)
+            return f"user_id:{user_id}"
+
+    def _sql_has_current_user_guardrail(self, sql: str, user_id: int, username: Optional[str] = None) -> bool:
+        """Accept only SELECT SQL scoped to the current owner identity."""
+        if not sql:
+            return False
+
+        sql_norm = " ".join(sql.split())
+        sql_compact = sql_norm.replace(" ", "").lower()
+        if not sql_norm.upper().startswith("SELECT"):
+            return False
+
+        uid = str(user_id)
+        has_user_id_scope = (
+            f"user_id={uid}" in sql_compact
+            or f"users.id={uid}" in sql_compact
+            or f".user_id={uid}" in sql_compact
+            or (
+                " from users " in f" {sql_norm.lower()} "
+                and f"id={uid}" in sql_compact
+            )
+        )
+
+        uname = (username or self._guardrail_username(user_id) or "").strip()
+        has_username_scope = False
+        if uname and not uname.startswith("user_id:"):
+            uname_escaped = re.escape(uname.lower())
+            has_username_scope = bool(
+                re.search(
+                    rf"(?:\b\w+\.)?username\s*=\s*['\"]{uname_escaped}['\"]",
+                    sql_norm.lower(),
+                )
+            )
+
+        return has_user_id_scope or has_username_scope
+
     def generate_sql(self, user_query: str, user_id: int) -> Dict[str, Any]:
         """
         Step 2: Generate SQL using GPT-4o with function calling.
         Falls back to Anthropic if GPT-4o fails.
         """
+        username = self._guardrail_username(user_id)
         schema = self._q_tpl_pair("q_telegram_db_schema")[0]
         sys_tpl, usr_t = self._q_tpl_pair("q_telegram_generate_sql")
         system_prompt = (
             sys_tpl.replace("__DB_SCHEMA__", schema).replace("__USER_ID__", str(user_id))
+        )
+        username_guardrail = (
+            f"users.username = {_sql_literal(username)}"
+            if username and not username.startswith("user_id:")
+            else f"users.id = {user_id}"
         )
         system_prompt += f"""
 
@@ -758,6 +1093,7 @@ Runtime grounding rules:
 - Prefer the latest resolved question and conversation context over isolated word matches.
 - For item, product, quantity, unit-price, or line-item questions, include documents.extracted_data as raw_data plus vendor/title/amount/date so the formatter can inspect nested OCR JSON.
 - For category breakdowns, category counts, or "highest expense by category" style questions, aggregate documents.expense_category and user_text_entries.expense_category together when relevant.
+- If the user asks for Telegram vs WhatsApp data, filter documents.source and user_text_entries.source using 'telegram' or 'whatsapp'.
 - For "kaise/how/breakdown" follow-ups after a total, return the contributing rows (title/text, amount, category, date) instead of another total-only aggregate.
 - For manual expense follow-ups ("kya kya liya", "kb liya", "kaha gya", "flight se kaha") return user_text_entries.text, amount, expense_category, created_at so the formatter can infer details from the saved text.
 - For category totals like shopping/travel, include user_text_entries and documents only when the saved category matches. Do not use unrelated receipt items just because they are in conversation history.
@@ -768,7 +1104,9 @@ Runtime grounding rules:
 - For named vendor/entity questions, constrain results to rows whose saved fields or extracted OCR JSON support that entity. Do not assume aliases or marketplace relationships unless the query/context explicitly states them.
 - If the vendor/entity phrase appears misspelled or contains a generic business type, search saved fields and extracted OCR JSON using the distinctive part(s) of the phrase rather than requiring the entire phrase to match exactly.
 - If exact structured SQL is uncertain, return rows with raw_data instead of collapsing to total_amount only.
-- Keep every query scoped to user_id = {user_id} and SELECT-only."""
+- Current authenticated owner guardrail is {username_guardrail}; internal owner key is user_id = {user_id}.
+- Keep every query SELECT-only and scoped to this exact current owner. Prefer joining users and filtering {username_guardrail}; user_id = {user_id} is also accepted as the internal owner key.
+- Never answer with rows for any other username/user_id, even if the user asks for someone else's data."""
         context = self._get_conversation_context(user_id)
         user_message = self._render_q_user_template(
             usr_t,
@@ -802,15 +1140,12 @@ Runtime grounding rules:
 
                 # Additional safety checks
                 if sql:
-                    has_user_filter = f"user_id = {user_id}" in sql or f"id = {user_id}" in sql
-                    is_select = sql.strip().upper().startswith("SELECT")
-
-                    if not has_user_filter or not is_select:
+                    if not self._sql_has_current_user_guardrail(sql, user_id, username):
                         return {
                             "sql": None,
                             "explanation": None,
                             "is_safe": False,
-                            "error": f"Security error: Query must filter by user_id = {user_id} and be SELECT only",
+                            "error": f"Security error: Query must be SELECT-only and scoped to username={username}",
                             "provider_used": result.provider_used.value
                         }
 
@@ -827,25 +1162,16 @@ Runtime grounding rules:
         # Fallback: try to parse from content (for Anthropic fallback)
         if result.success and result.data:
             content = result.data.get("content", "")
-            try:
-                # Try to extract JSON
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
-                parsed = json.loads(content)
-
+            parsed = _extract_json_object_from_text(content)
+            if parsed:
                 sql = parsed.get("sql", "")
                 if sql:
-                    has_user_filter = f"user_id = {user_id}" in sql or f"id = {user_id}" in sql
-                    is_select = sql.strip().upper().startswith("SELECT")
-
-                    if not has_user_filter or not is_select:
+                    if not self._sql_has_current_user_guardrail(sql, user_id, username):
                         return {
                             "sql": None,
                             "explanation": None,
                             "is_safe": False,
-                            "error": f"Security error: Query must filter by user_id = {user_id}",
+                            "error": f"Security error: Query must be SELECT-only and scoped to username={username}",
                             "provider_used": result.provider_used.value
                         }
 
@@ -856,8 +1182,8 @@ Runtime grounding rules:
                     "error": parsed.get("error"),
                     "provider_used": result.provider_used.value
                 }
-            except Exception as e:
-                logger.error(f"Failed to parse SQL content: {e}")
+            if content and content.strip():
+                logger.warning("SQL fallback content was not JSON; ignoring provider content.")
 
         # Both models failed
         return {
@@ -869,24 +1195,15 @@ Runtime grounding rules:
         }
 
     def execute_query(self, sql: str, user_id: Optional[int] = None) -> Dict[str, Any]:
-        """Execute SQL against PostgreSQL (DATABASE_URL). Optional user_id re-validates guardrail."""
+        """Execute SQL against PostgreSQL and re-validate current-user guardrails."""
         if user_id is not None and sql:
-            sql_norm = " ".join(sql.split())
-            uid = str(user_id)
-            has_user_scope = (
-                f"user_id = {uid}" in sql_norm
-                or f"user_id={uid}" in sql_norm.replace(" ", "")
-                or (
-                    " from users " in f" {sql_norm.lower()} "
-                    and f"id = {uid}" in sql_norm
-                )
-            )
-            if not sql_norm.upper().startswith("SELECT") or not has_user_scope:
+            username = self._guardrail_username(user_id)
+            if not self._sql_has_current_user_guardrail(sql, user_id, username):
                 return {
                     "columns": [],
                     "rows": [],
                     "row_count": 0,
-                    "error": f"Security error: query must be SELECT and scoped to user_id={user_id}",
+                    "error": f"Security error: query must be SELECT and scoped to username={username}",
                 }
         try:
             with engine.connect() as conn:
@@ -1261,10 +1578,27 @@ Runtime grounding rules:
         self, user_query: str, user_id: int, n_results: int = 10
     ) -> List[Dict[str, Any]]:
         """Chroma semantic search + SQL token match, enriched from PostgreSQL (user_id scoped)."""
+        username = self._guardrail_username(user_id)
         results = self.vector_service.search(
             query=user_query,
             user_id=user_id,
             n_results=n_results,
+            username=username if not username.startswith("user_id:") else None,
+        )
+        results = [
+            r for r in results
+            if int(r.get("user_id", user_id)) == int(user_id)
+            and (
+                not r.get("username")
+                or username.startswith("user_id:")
+                or r.get("username") == username
+            )
+        ]
+        logger.info(
+            "Vector guardrail retained %s hits for username=%s user_id=%s",
+            len(results),
+            username,
+            user_id,
         )
 
         if not results:

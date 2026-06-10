@@ -178,6 +178,9 @@ class VectorService:
                 "doc_id": did,
                 "text": text[:1000],
             }
+            username = (doc_data.get("username") or "").strip()
+            if username:
+                meta_base["username"] = username[:255]
             if ec:
                 meta_base["expense_category"] = str(ec)[:80]
 
@@ -223,6 +226,7 @@ class VectorService:
         text: str,
         intent_tag: str = "expense_text",
         expense_category: Optional[str] = None,
+        username: Optional[str] = None,
     ) -> bool:
         """Add user free-text entry to vector DB for semantic recall."""
         try:
@@ -239,6 +243,9 @@ class VectorService:
                 "intent_tag": intent_tag,
                 "text": normalized_text[:1000],
             }
+            normalized_username = (username or "").strip()
+            if normalized_username:
+                meta["username"] = normalized_username[:255]
             if expense_category:
                 meta["expense_category"] = str(expense_category)[:80]
 
@@ -268,12 +275,13 @@ class VectorService:
         self,
         query: str,
         user_id: int,
-        n_results: int = 10
+        n_results: int = 10,
+        username: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search documents by semantic similarity.
 
-        SECURITY: Always filters by user_id - users can only see their own documents.
+        SECURITY: Always filters by user_id and drops any username metadata mismatch.
 
         Args:
             query: Search query text
@@ -312,11 +320,34 @@ class VectorService:
 
             # Format results
             matches = []
+            expected_username = (username or "").strip()
             if results['ids'] and results['ids'][0]:
                 for i, doc_id in enumerate(results['ids'][0]):
                     metadata = results['metadatas'][0][i] if results['metadatas'] else {}
                     document = results['documents'][0][i] if results['documents'] else ""
                     distance = results['distances'][0][i] if results['distances'] else 1.0
+
+                    metadata_user_id = metadata.get("user_id", user_id)
+                    try:
+                        if int(metadata_user_id) != int(user_id):
+                            logger.warning(
+                                "Dropped vector hit with mismatched user_id metadata=%s expected=%s",
+                                metadata_user_id,
+                                user_id,
+                            )
+                            continue
+                    except (TypeError, ValueError):
+                        logger.warning("Dropped vector hit with invalid user_id metadata=%s", metadata_user_id)
+                        continue
+
+                    metadata_username = (metadata.get("username") or "").strip()
+                    if expected_username and metadata_username and metadata_username != expected_username:
+                        logger.warning(
+                            "Dropped vector hit with mismatched username metadata=%s expected=%s",
+                            metadata_username,
+                            expected_username,
+                        )
+                        continue
 
                     # Calculate similarity score (0-100%)
                     similarity = max(0, min(100, (1 - distance) * 100))
@@ -336,7 +367,8 @@ class VectorService:
                             "doc_id": None,
                             "text_entry_id": text_entry_id,
                             "entry_type": "user_text_entry",
-                            "user_id": metadata.get("user_id", user_id),
+                            "user_id": metadata_user_id,
+                            "username": metadata_username or expected_username,
                             "text": document[:500],
                             "expense_category": metadata.get("expense_category"),
                             "similarity_score": round(similarity, 2),
@@ -354,7 +386,8 @@ class VectorService:
                         "doc_id": doc_id_int,
                         "text_entry_id": None,
                         "entry_type": "document",
-                        "user_id": metadata.get("user_id", user_id),
+                        "user_id": metadata_user_id,
+                        "username": metadata_username or expected_username,
                         "text": document[:500],  # Truncate for display
                         "expense_category": metadata.get("expense_category"),
                         "similarity_score": round(similarity, 2),

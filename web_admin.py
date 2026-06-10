@@ -99,6 +99,7 @@ def get_documents(limit: int = 100):
                 "file_name": row["file_name"],
                 "mime_type": row["mime_type"],
                 "file_size": row["file_size"],
+                "source": row["source"] if "source" in row.keys() else "telegram",
                 "document_type": row["document_type"],
                 "title": row["title"],
                 "document_date": row["document_date"],
@@ -122,13 +123,14 @@ def get_expense_categories():
 
 
 @app.get("/api/user-expenses")
-def get_user_expenses(category: Optional[str] = None, limit: int = 200):
-    """Documents + text entries for current user, optionally filtered by category."""
+def get_user_expenses(category: Optional[str] = None, source: Optional[str] = None, limit: int = 200):
+    """Documents + text entries for current user, optionally filtered by category/source."""
     if current_session["user_id"] is None:
         raise HTTPException(status_code=400, detail="No user selected")
     items = DatabaseService.get_user_expense_items(
         current_session["user_id"],
         category=category or None,
+        source=source or None,
         limit=limit,
     )
     return {"items": items, "count": len(items)}

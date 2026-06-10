@@ -94,6 +94,7 @@ class Document(Base):
     file_name = Column(String(500), nullable=True)
     mime_type = Column(String(100), nullable=True)
     file_size = Column(Integer, nullable=True)
+    source = Column(String(20), nullable=False, default='telegram', index=True)
     telegram_file_unique_id = Column(String(255), nullable=True, index=True)
     content_sha256 = Column(String(64), nullable=True, index=True)
     dhash = Column(String(64), nullable=True, index=True)
@@ -135,6 +136,7 @@ class Document(Base):
             "file_name": self.file_name,
             "mime_type": self.mime_type,
             "file_size": self.file_size,
+            "source": self.source,
             "extracted_data": json.loads(self.extracted_data) if self.extracted_data else None,
             "document_type": self.document_type,
             "title": self.title,
@@ -162,7 +164,7 @@ class PendingDocument(Base):
     # Unique token for accessing this pending document (shared across Telegram/Web)
     token = Column(String(100), unique=True, nullable=False, index=True)
     
-    # Source: 'telegram' or 'web'
+    # Source: 'telegram', 'whatsapp', or 'web'
     source = Column(String(20), nullable=False, default='web')
     
     # Document metadata
@@ -240,6 +242,7 @@ class UserTextEntry(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     text = Column(Text, nullable=False)
+    source = Column(String(20), nullable=False, default='telegram', index=True)
     intent_tag = Column(String(100), nullable=True)
     expense_category = Column(String(50), nullable=True)
     amount = Column(Float, nullable=True)
@@ -253,6 +256,7 @@ class UserTextEntry(Base):
             "id": self.id,
             "user_id": self.user_id,
             "text": self.text,
+            "source": self.source,
             "intent_tag": self.intent_tag,
             "expense_category": self.expense_category,
             "amount": self.amount,
@@ -284,6 +288,7 @@ def init_db():
     _ensure_expense_category_columns()
     _ensure_user_input_text_columns()
     _ensure_user_text_entry_amount_columns()
+    _ensure_source_columns()
     _normalize_existing_expense_categories()
     _seed_telegram_q_prompts()
     _migrate_prompts_from_sqlite_wording()
@@ -362,6 +367,21 @@ def _ensure_user_text_entry_amount_columns():
             conn.execute(text("ALTER TABLE user_text_entries ADD COLUMN amount FLOAT"))
         if "currency" not in cols:
             conn.execute(text("ALTER TABLE user_text_entries ADD COLUMN currency VARCHAR(10)"))
+        conn.commit()
+
+
+def _ensure_source_columns():
+    """Add bot/source channel columns for existing databases."""
+    with engine.connect() as conn:
+        doc_cols = _table_column_names("documents")
+        if "source" not in doc_cols:
+            conn.execute(text("ALTER TABLE documents ADD COLUMN source VARCHAR(20) DEFAULT 'telegram' NOT NULL"))
+        pending_cols = _table_column_names("pending_documents")
+        if "source" not in pending_cols:
+            conn.execute(text("ALTER TABLE pending_documents ADD COLUMN source VARCHAR(20) DEFAULT 'web' NOT NULL"))
+        text_cols = _table_column_names("user_text_entries")
+        if text_cols and "source" not in text_cols:
+            conn.execute(text("ALTER TABLE user_text_entries ADD COLUMN source VARCHAR(20) DEFAULT 'telegram' NOT NULL"))
         conn.commit()
 
 
@@ -599,6 +619,7 @@ class DatabaseService:
     def get_user_expense_items(
         user_id: int,
         category: Optional[str] = None,
+        source: Optional[str] = None,
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
         """Unified expense rows from documents + manual text entries (for UI)."""
@@ -616,6 +637,7 @@ class DatabaseService:
                 cat = DatabaseService.normalize_expense_category_label(doc.expense_category)
                 items.append({
                     "source": "document",
+                    "channel": doc.source or "telegram",
                     "id": doc.id,
                     "expense_category": cat,
                     "payment": doc.total_amount,
@@ -640,6 +662,7 @@ class DatabaseService:
                 cat = DatabaseService.normalize_expense_category_label(entry.expense_category)
                 items.append({
                     "source": "text",
+                    "channel": entry.source or "telegram",
                     "id": entry.id,
                     "expense_category": cat,
                     "payment": entry.amount,
@@ -654,6 +677,9 @@ class DatabaseService:
             if category:
                 norm = DatabaseService.normalize_expense_category_label(category)
                 items = [i for i in items if i["expense_category"] == norm]
+            if source:
+                source_norm = source.strip().lower()
+                items = [i for i in items if (i.get("channel") or "").lower() == source_norm]
 
             items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
             return items[:limit]
@@ -769,6 +795,7 @@ class DatabaseService:
                       file_size: Optional[int], extracted_json: str,
                       raw_text: Optional[str] = None,
                       user_input_text: Optional[str] = None,
+                      source: str = "telegram",
                       telegram_file_unique_id: Optional[str] = None,
                       content_sha256: Optional[str] = None,
                       dhash: Optional[str] = None,
@@ -799,6 +826,7 @@ class DatabaseService:
                 file_name=file_name,
                 mime_type=mime_type,
                 file_size=file_size,
+                source=(source or "telegram").strip().lower(),
                 telegram_file_unique_id=telegram_file_unique_id,
                 content_sha256=content_sha256,
                 dhash=dhash,
@@ -837,10 +865,14 @@ class DatabaseService:
     @staticmethod
     def _vector_payload_from_document(doc: Document) -> Dict[str, Any]:
         """Shape expected by vector_service._document_to_text (extracted_json key)."""
+        user = DatabaseService.get_user_by_id(int(doc.user_id))
+        username = (getattr(user, "username", None) or "").strip() if user else ""
         return {
             "id": doc.id,
             "user_id": doc.user_id,
+            "username": username,
             "file_name": doc.file_name,
+            "source": doc.source,
             "document_type": doc.document_type,
             "title": doc.title,
             "vendor_name": doc.vendor_name,
@@ -880,6 +912,8 @@ class DatabaseService:
     @staticmethod
     def index_user_text_entry_in_vector(entry: UserTextEntry, attempts: int = 3) -> bool:
         vs = get_vector_service()
+        user = DatabaseService.get_user_by_id(int(entry.user_id))
+        username = (getattr(user, "username", None) or "").strip() if user else ""
         for i in range(attempts):
             if vs.add_user_text_entry(
                 entry_id=int(entry.id),
@@ -887,6 +921,7 @@ class DatabaseService:
                 text=entry.text,
                 intent_tag=entry.intent_tag or "expense_text",
                 expense_category=entry.expense_category,
+                username=username,
             ):
                 return True
             logger.warning(
@@ -955,6 +990,7 @@ class DatabaseService:
         user_text: str,
         intent_tag: str = "expense_text",
         expense_category: Optional[str] = None,
+        source: str = "telegram",
     ) -> Optional[UserTextEntry]:
         """Persist expense-related user text and index it in vector DB."""
         db = get_db()
@@ -993,6 +1029,7 @@ class DatabaseService:
             entry = UserTextEntry(
                 user_id=user_id,
                 text=cleaned,
+                source=(source or "telegram").strip().lower(),
                 intent_tag=intent_tag,
                 expense_category=category,
                 amount=amount,
@@ -1052,6 +1089,7 @@ class DatabaseService:
             for d in docs:
                 out[d.id] = {
                     "id": d.id,
+                "source": d.source,
                     "document_type": d.document_type,
                     "title": d.title,
                     "total_amount": d.total_amount,
@@ -1083,6 +1121,7 @@ class DatabaseService:
                 out[t.id] = {
                     "id": t.id,
                     "text": t.text,
+                "source": t.source,
                     "amount": t.amount,
                     "currency": t.currency,
                     "expense_category": t.expense_category,
@@ -1306,6 +1345,7 @@ class DatabaseService:
                 file_size=pending.file_size,
                 extracted_json=pending.extracted_data,
                 user_input_text=pending.user_input_text,
+                source=pending.source,
                 telegram_file_unique_id=pending.telegram_file_unique_id,
                 content_sha256=pending.content_sha256,
                 dhash=pending.dhash,

@@ -1,9 +1,10 @@
-# Telegram Bot with AI (Gemini + Claude)
+# Telegram + WhatsApp Bot with AI (Gemini + Claude)
 
-Production-ready Telegram bot with AI integration. Small, reliable, Telegram-first.
+Production-ready receipt bot with Telegram polling and Twilio WhatsApp webhook support.
 
 ## Features
 
+- Telegram and WhatsApp chat entry points
 - `/start`, `/help`, `/clear` commands
 - `/websearch <query>` - Real-time web search with retries & timeout
 - **Multi-model OCR**: Gemini 2.5 Flash (primary) + Claude Opus 4.5 (fallback) with confidence-based routing
@@ -24,8 +25,11 @@ pip install -r bot_telegram/requirements.txt
 cp .env.example .env
 nano .env  # Add TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, and ANTHROPIC_API_KEY
 
-# 3. Run
+# 3. Run Telegram
 python run_bot.py
+
+# 4. Run WhatsApp webhook
+python run_whatsapp_bot.py
 ```
 
 ## Async OCR Queue (Redis + Celery)
@@ -44,6 +48,19 @@ sudo systemctl status redis
 ```bash
 source env/bin/activate
 python run_bot.py
+```
+
+### Start WhatsApp bot (Twilio webhook)
+
+```bash
+source env/bin/activate
+python run_whatsapp_bot.py
+```
+
+Configure your Twilio WhatsApp sandbox/number webhook to:
+
+```text
+POST https://your-public-domain/whatsapp/webhook
 ```
 
 ### 3) Start Celery worker (consumer)
@@ -89,6 +106,10 @@ TELEGRAM_BOT_TOKEN=your_token_here
 GOOGLE_API_KEY=your_key_here          # Primary for AI tasks (chat, NLP, SQL generation, OCR, embeddings)
 ANTHROPIC_API_KEY=your_key_here       # Fallback for AI tasks (chat, NLP, SQL generation, OCR) - Claude Opus 4.5
 ALLOWED_TELEGRAM_USER_IDS=your_telegram_user_id
+TWILIO_ACCOUNT_SID=your_twilio_account_sid
+TWILIO_AUTH_TOKEN=your_twilio_auth_token
+TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+ALLOWED_WHATSAPP_NUMBERS=+918114437166
 ```
 
 ### 3. Startup Command (Server)
@@ -153,6 +174,10 @@ sudo journalctl -u telegram-bot -f  # View logs
 | `GOOGLE_API_KEY` | Yes | From Google AI Studio (primary for AI tasks + embeddings) |
 | `ANTHROPIC_API_KEY` | Yes | From Anthropic Console (fallback for AI tasks - Claude Opus 4.5) |
 | `ALLOWED_TELEGRAM_USER_IDS` | No | Comma-separated IDs (empty = allow all) |
+| `TWILIO_ACCOUNT_SID` | For WhatsApp | From Twilio Console |
+| `TWILIO_AUTH_TOKEN` | For WhatsApp | From Twilio Console |
+| `TWILIO_WHATSAPP_FROM` | For WhatsApp | Twilio WhatsApp sender, e.g. `whatsapp:+14155238886` |
+| `ALLOWED_WHATSAPP_NUMBERS` | No | Comma-separated phone numbers (empty = allow all) |
 
 Optional (defaults shown):
 - `OPENAI_TIMEOUT=45` (legacy, can be removed)
@@ -163,8 +188,9 @@ Optional (defaults shown):
 ## Security
 
 1. Set `ALLOWED_TELEGRAM_USER_IDS` to restrict access
-2. Never commit `.env` (already in .gitignore)
-3. Get user ID from @userinfobot
+2. Set `ALLOWED_WHATSAPP_NUMBERS` to restrict WhatsApp access
+3. Never commit `.env` (already in .gitignore)
+4. Get user ID from @userinfobot
 
 ## Troubleshooting
 
@@ -189,11 +215,16 @@ cat .env | grep ALLOWED_TELEGRAM_USER_IDS
 │   ├── handlers.py      # Command handlers
 │   ├── config.py        # Configuration
 │   └── requirements.txt # Dependencies
+├── bot_whatsapp/
+│   ├── bot.py           # Twilio webhook app
+│   ├── config.py        # Twilio/allowlist configuration
+│   └── sender.py        # Outbound WhatsApp helper
 ├── shared/
 │   ├── openai_client.py # OpenAI service
 │   └── ocr_service.py   # Multi-model OCR (Gemini + Claude)
 ├── .env.example         # Template
 ├── run_bot.py          # Runner
+├── run_whatsapp_bot.py # WhatsApp webhook runner
 └── README.md
 ```
 
