@@ -600,6 +600,19 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 mime_type="image/jpeg",
                 user_input_text=user_input_text or None
             )
+
+            # Gemini unreadable-image guard
+            result_data = _safe_json_loads(result)
+            if result_data.get("status") == "unreadable":
+                await update.message.reply_text(
+                    result_data.get(
+                        "message",
+                        "I couldn't clearly understand the uploaded image. "
+                        "Please re-upload a clearer image.",
+                    )
+                )
+                return
+
             duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, result)
             if duplicate_after_ocr:
                 await update.message.reply_text(
@@ -756,6 +769,19 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 mime_type=mime_type,
                 user_input_text=user_input_text or None
             )
+
+            # Gemini unreadable-image guard
+            result_data = _safe_json_loads(result)
+            if result_data.get("status") == "unreadable":
+                await update.message.reply_text(
+                    result_data.get(
+                        "message",
+                        "I couldn't clearly understand the uploaded image. "
+                        "Please re-upload a clearer image.",
+                    )
+                )
+                return
+
             if mime_type.startswith("image/"):
                 duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, result)
                 if duplicate_after_ocr:

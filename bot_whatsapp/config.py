@@ -29,6 +29,8 @@ class Settings:
     WHATSAPP_VERIFY_TWILIO_SIGNATURE = os.getenv("WHATSAPP_VERIFY_TWILIO_SIGNATURE", "false").lower() == "true"
     WHATSAPP_PUBLIC_BASE_URL = os.getenv("WHATSAPP_PUBLIC_BASE_URL", "").rstrip("/")
     WHATSAPP_MESSAGE_CACHE_SECONDS = int(os.getenv("WHATSAPP_MESSAGE_CACHE_SECONDS", "900"))
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/2")
+    WHATSAPP_REQUEST_STATE_TTL_SECONDS = int(os.getenv("WHATSAPP_REQUEST_STATE_TTL_SECONDS", "900"))
 
     ALLOWED_WHATSAPP_NUMBERS: Set[str] = set(
         normalize_whatsapp_number(num)

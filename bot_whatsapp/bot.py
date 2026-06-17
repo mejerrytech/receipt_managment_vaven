@@ -5,6 +5,8 @@ import json
 import logging
 import re
 import time
+import asyncio
+import uuid
 from xml.sax.saxutils import escape
 from urllib.parse import parse_qs
 
@@ -20,7 +22,19 @@ from shared.nlp_sql_service_v2 import get_nlp_sql_service_v2
 from shared.ocr_service import get_ocr_service
 from shared.openai_client import OpenAIService
 from shared.rag_service import get_rag_service
-from shared.upload_card_service import build_upload_preview_card
+from shared.upload_card_service import build_whatsapp_review_message
+from shared.whatsapp_request_state import (
+    WhatsappRequestRef,
+    claim_process_once,
+    claim_send_once,
+    cleanup_request_state,
+    extract_basic_fields_from_ocr_json,
+    get_redis_client,
+    init_request_state,
+    mark_completed,
+    mark_error,
+    patch_state,
+)
 
 logger = logging.getLogger("whatsapp_bot")
 
@@ -30,6 +44,8 @@ db_service = DatabaseService()
 nlp_service_v2 = get_nlp_sql_service_v2()
 rag_service = get_rag_service()
 ocr_service = get_ocr_service()
+_REDIS_CLIENT = None
+_LOCAL_SEND_CLAIMS: dict[str, float] = {}
 
 SUPPORTED_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
 _MESSAGE_RESPONSE_CACHE: dict[str, tuple[float, str]] = {}
@@ -68,32 +84,32 @@ def _is_valid_twilio_signature(request: Request, form: dict[str, str]) -> bool:
 
 
 def _xml_response(*messages: str) -> Response:
-    return Response(content=_xml_content(*messages), media_type="application/xml")
+    # Twilio expects XML; use a conservative content-type for maximum compatibility.
+    return Response(content=_xml_content(*messages), media_type="text/xml; charset=utf-8")
 
 
 def _xml_content(*messages: str) -> str:
     parts = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<Response>"]
     for text in messages:
-        for chunk in _chunk_text(text):
-            parts.append(f"<Message>{escape(chunk)}</Message>")
+        if text:
+            parts.append(f"<Message>{escape(text)}</Message>")
     parts.append("</Response>")
     return "".join(parts)
 
 
 def _cacheable_xml_response(message_sid: str, *messages: str) -> Response:
     content = _xml_content(*messages)
-    preview = " | ".join((message or "").replace("\n", " ")[:180] for message in messages)
+    preview = " | ".join((message or "").replace("\n", " ")[:180] for message in messages) if messages else "(empty)"
     logger.info(
-        "WhatsApp TwiML response sid=%s messages=%s chars=%s preview=%s",
+        "WhatsApp TwiML response sid=%s chars=%s preview=%s",
         message_sid or "-",
-        len(messages),
         len(content),
         preview,
     )
     if message_sid:
         _MESSAGE_RESPONSE_CACHE[message_sid] = (time.time(), content)
         _cleanup_message_cache()
-    return Response(content=content, media_type="application/xml")
+    return Response(content=content, media_type="text/xml; charset=utf-8")
 
 
 def _cached_response_for(message_sid: str) -> Response | None:
@@ -106,7 +122,7 @@ def _cached_response_for(message_sid: str) -> Response | None:
     if time.time() - created_at > settings.WHATSAPP_MESSAGE_CACHE_SECONDS:
         _MESSAGE_RESPONSE_CACHE.pop(message_sid, None)
         return None
-    return Response(content=content, media_type="application/xml")
+    return Response(content=content, media_type="text/xml; charset=utf-8")
 
 
 def _cleanup_message_cache() -> None:
@@ -119,23 +135,115 @@ def _cleanup_message_cache() -> None:
         _MESSAGE_RESPONSE_CACHE.pop(sid, None)
 
 
-def _chunk_text(text: str, max_length: int = 1500) -> list[str]:
-    text = (text or "").strip() or "No response generated."
+# Twilio hard limit is 1600 chars per WhatsApp message body.
+WHATSAPP_PART_LIMIT = 1500
+
+
+def _split_for_whatsapp(text: str, max_length: int = WHATSAPP_PART_LIMIT) -> list[str]:
+    """Split a long message into WhatsApp-sized parts on line boundaries.
+
+    Twilio rejects any single message body over 1600 chars (error 21617), so a
+    long OCR card MUST be delivered as several separate messages.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
     if len(text) <= max_length:
         return [text]
-    chunks: list[str] = []
+
+    parts: list[str] = []
     current = ""
-    for paragraph in text.split("\n\n"):
-        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
         if len(candidate) <= max_length:
             current = candidate
             continue
         if current:
-            chunks.append(current)
-        current = paragraph
+            parts.append(current)
+            current = ""
+        # A single line longer than the limit must be hard-split.
+        while len(line) > max_length:
+            parts.append(line[:max_length])
+            line = line[max_length:]
+        current = line
     if current:
-        chunks.append(current)
-    return chunks
+        parts.append(current)
+    return parts
+
+
+def _send_whatsapp_message_sync(to: str, body: str) -> None:
+    """Send a WhatsApp reply via Twilio REST API, splitting into ≤1500-char parts."""
+    if not settings.TWILIO_ACCOUNT_SID or not settings.TWILIO_AUTH_TOKEN:
+        raise RuntimeError("Twilio credentials not configured")
+
+    parts = _split_for_whatsapp(body)
+    total = len(parts)
+    for index, part in enumerate(parts, start=1):
+        response = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{settings.TWILIO_ACCOUNT_SID}/Messages.json",
+            auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+            data={
+                "From": settings.TWILIO_WHATSAPP_FROM,
+                "To": to,
+                "Body": part,
+            },
+            timeout=settings.WHATSAPP_MEDIA_TIMEOUT_SECONDS,
+        )
+        if not response.ok:
+            logger.error(
+                "Twilio REST send failed part=%s/%s status=%s body=%s",
+                index,
+                total,
+                response.status_code,
+                response.text[:500],
+            )
+            response.raise_for_status()
+        logger.info(
+            "WhatsApp REST message sent to=%s part=%s/%s chars=%s",
+            normalize_whatsapp_number(to),
+            index,
+            total,
+            len(part),
+        )
+
+
+async def _send_whatsapp_message(to: str, body: str) -> None:
+    await asyncio.to_thread(_send_whatsapp_message_sync, to, body)
+
+
+def _send_whatsapp_single_message_sync(to: str, body: str) -> None:
+    """Send exactly ONE WhatsApp message (prompt output must already fit Twilio limit)."""
+    if not settings.TWILIO_ACCOUNT_SID or not settings.TWILIO_AUTH_TOKEN:
+        raise RuntimeError("Twilio credentials not configured")
+
+    message = (body or "").strip()
+    response = requests.post(
+        f"https://api.twilio.com/2010-04-01/Accounts/{settings.TWILIO_ACCOUNT_SID}/Messages.json",
+        auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+        data={
+            "From": settings.TWILIO_WHATSAPP_FROM,
+            "To": to,
+            "Body": message,
+        },
+        timeout=settings.WHATSAPP_MEDIA_TIMEOUT_SECONDS,
+    )
+    if not response.ok:
+        logger.error(
+            "Twilio single send failed chars=%s status=%s body=%s",
+            len(message),
+            response.status_code,
+            response.text[:500],
+        )
+        response.raise_for_status()
+    logger.info(
+        "WhatsApp single message sent to=%s chars=%s",
+        normalize_whatsapp_number(to),
+        len(message),
+    )
+
+
+async def _send_whatsapp_single_message(to: str, body: str) -> None:
+    await asyncio.to_thread(_send_whatsapp_single_message_sync, to, body)
 
 
 def _get_or_create_user(from_value: str):
@@ -359,15 +467,17 @@ def _download_twilio_media(media_url: str) -> bytes:
     return response.content
 
 
-async def _handle_media_upload(form: dict[str, str], db_user) -> str:
-    mime_type = form.get("MediaContentType0", "")
-    if mime_type not in SUPPORTED_MEDIA_TYPES:
-        return f"I can process JPG, PNG, WEBP, and PDF files. Received: {mime_type or 'unknown'}"
-
-    file_bytes = _download_twilio_media(form.get("MediaUrl0", ""))
+async def _build_media_review_reply(
+    *,
+    db_user,
+    file_bytes: bytes,
+    mime_type: str,
+    caption: str,
+    ocr_raw: str,
+) -> str:
+    """Build pending-document review card with full OCR text for user confirm/edit."""
     file_size = len(file_bytes)
     file_name = "whatsapp-upload.pdf" if mime_type == "application/pdf" else "whatsapp-upload.jpg"
-    caption = (form.get("Body") or "").strip()
     content_sha256 = hashlib.sha256(file_bytes).hexdigest()
     dhash = None
     phash = None
@@ -383,23 +493,18 @@ async def _handle_media_upload(form: dict[str, str], db_user) -> str:
         if duplicate:
             return "Duplicate image detected. This upload was not saved again."
 
-    result = await ocr_service.extract_data(
-        image_bytes=file_bytes,
-        mime_type=mime_type,
-        user_input_text=caption or None,
-    )
     if mime_type.startswith("image/"):
-        duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, result)
+        duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(db_user.id, ocr_raw)
         if duplicate_after_ocr:
             return "Duplicate document detected after OCR. This upload was not saved again."
 
-    confidence = _get_confidence(result)
+    confidence = _get_confidence(ocr_raw)
     pending = db_service.create_pending_document(
         user_id=db_user.id,
         file_name=file_name,
         mime_type=mime_type,
         file_size=file_size,
-        extracted_json=result,
+        extracted_json=ocr_raw,
         confidence_overall=confidence,
         user_input_text=caption or None,
         source="whatsapp",
@@ -408,12 +513,204 @@ async def _handle_media_upload(form: dict[str, str], db_user) -> str:
         phash=phash,
         status="pending",
     )
-    preview = await build_upload_preview_card(result, confidence)
-    return (
-        f"Upload processed. Pending ID: {pending.id}\n\n"
-        f"{preview}\n\n"
-        f"Reply CONFIRM {pending.id} to save, or EDIT {pending.id} {{corrected_json}}."
+    return await build_whatsapp_review_message(ocr_raw, pending.id)
+
+
+async def _handle_media_upload(form: dict[str, str], db_user) -> str:
+    mime_type = form.get("MediaContentType0", "")
+    if mime_type not in SUPPORTED_MEDIA_TYPES:
+        return f"I can process JPG, PNG, WEBP, and PDF files. Received: {mime_type or 'unknown'}"
+
+    file_bytes = _download_twilio_media(form.get("MediaUrl0", ""))
+    caption = (form.get("Body") or "").strip()
+
+    result = await ocr_service.extract_data(
+        image_bytes=file_bytes,
+        mime_type=mime_type,
+        user_input_text=caption or None,
     )
+
+    try:
+        result_data = json.loads(result)
+    except Exception:
+        result_data = {}
+    if result_data.get("status") == "unreadable":
+        return result_data.get(
+            "message",
+            "I couldn't clearly understand the uploaded image. Please re-upload a clearer image.",
+        )
+
+    return await _build_media_review_reply(
+        db_user=db_user,
+        file_bytes=file_bytes,
+        mime_type=mime_type,
+        caption=caption,
+        ocr_raw=result,
+    )
+
+
+async def _redis():
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+    _REDIS_CLIENT = await get_redis_client(settings.REDIS_URL)
+    return _REDIS_CLIENT
+
+
+async def _redis_optional():
+    try:
+        return await _redis()
+    except Exception as exc:
+        logger.warning("Redis unavailable (%s); continuing with in-memory dedupe only", exc)
+        return None
+
+
+def _local_claim_send_once(key: str, ttl_seconds: int) -> bool:
+    now = time.time()
+    stale = [k for k, ts in _LOCAL_SEND_CLAIMS.items() if now - ts > ttl_seconds]
+    for k in stale:
+        _LOCAL_SEND_CLAIMS.pop(k, None)
+    if key in _LOCAL_SEND_CLAIMS:
+        return False
+    _LOCAL_SEND_CLAIMS[key] = now
+    return True
+
+
+async def _claim_process_once(client, ref: WhatsappRequestRef) -> bool:
+    ttl = settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS
+    if client is not None:
+        return await claim_process_once(client, ref, ttl_seconds=ttl)
+    return _local_claim_send_once(f"{ref.key}:processing", ttl)
+
+
+async def _claim_send_once(client, ref: WhatsappRequestRef) -> bool:
+    ttl = settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS
+    if client is not None:
+        return await claim_send_once(client, ref, ttl_seconds=ttl)
+    return _local_claim_send_once(ref.sent_key, ttl)
+
+
+async def _process_media_request_and_send(
+    *,
+    from_value: str,
+    from_number: str,
+    request_id: str,
+    message_sid: str,
+    form: dict[str, str],
+    db_user,
+) -> None:
+    ref = WhatsappRequestRef(phone_number=from_number, request_id=request_id)
+    client = None
+    try:
+        client = await _redis_optional()
+
+        if not await _claim_process_once(client, ref):
+            logger.info("Skipping duplicate processing for %s", ref.key)
+            return
+
+        if client is not None:
+            await init_request_state(
+                client,
+                ref,
+                ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS,
+                from_address=from_value,
+                message_sid=message_sid,
+            )
+
+        mime_type = form.get("MediaContentType0", "")
+        if mime_type not in SUPPORTED_MEDIA_TYPES:
+            msg = f"I can process JPG, PNG, WEBP, and PDF files. Received: {mime_type or 'unknown'}"
+            if client is not None:
+                await mark_error(client, ref, msg, ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS)
+            if await _claim_send_once(client, ref):
+                await _send_whatsapp_single_message(from_value, msg)
+            return
+
+        file_bytes = _download_twilio_media(form.get("MediaUrl0", ""))
+        caption = (form.get("Body") or "").strip()
+
+        # Phase 2: OCR — no WhatsApp send until complete.
+        ocr_raw = await ocr_service.extract_data(
+            image_bytes=file_bytes,
+            mime_type=mime_type,
+            user_input_text=caption or None,
+        )
+        if client is not None:
+            await patch_state(
+                client,
+                ref,
+                {"status": "ocr_complete", "ocr": ocr_raw},
+                ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS,
+            )
+
+        try:
+            ocr_data = json.loads(ocr_raw)
+        except Exception:
+            ocr_data = {}
+        if isinstance(ocr_data, dict) and ocr_data.get("status") == "unreadable":
+            msg = ocr_data.get(
+                "message",
+                "I couldn't clearly understand the uploaded image. Please re-upload a clearer image.",
+            )
+            if client is not None:
+                await mark_error(client, ref, msg, ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS)
+            if await _claim_send_once(client, ref):
+                await _send_whatsapp_single_message(from_value, msg)
+            return
+
+        # Phase 3–5: build full review card in Redis — send only when ready.
+        final_message = await _build_media_review_reply(
+            db_user=db_user,
+            file_bytes=file_bytes,
+            mime_type=mime_type,
+            caption=caption,
+            ocr_raw=ocr_raw,
+        )
+
+        extracted_fields = extract_basic_fields_from_ocr_json(ocr_raw)
+        if client is not None:
+            await patch_state(
+                client,
+                ref,
+                {
+                    "status": "card_ready",
+                    "extraction": extracted_fields,
+                    "categorization": {"category": extracted_fields.get("category")},
+                    "final_message": final_message,
+                },
+                ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS,
+            )
+            await mark_completed(
+                client,
+                ref,
+                final_message=final_message,
+                ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS,
+            )
+
+        # Single Twilio send after all extraction + card aggregation is done.
+        if not await _claim_send_once(client, ref):
+            logger.info("Skipping duplicate send for %s", ref.key)
+            return
+        await _send_whatsapp_single_message(from_value, final_message)
+    except Exception:
+        logger.exception("WhatsApp media pipeline failed request=%s", ref.key)
+        msg = "Sorry, I could not process that upload right now. Please try again."
+        if client is not None:
+            try:
+                await mark_error(client, ref, msg, ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS)
+            except Exception:
+                pass
+        if await _claim_send_once(client, ref):
+            try:
+                await _send_whatsapp_single_message(from_value, msg)
+            except Exception:
+                pass
+    finally:
+        if client is not None:
+            try:
+                await cleanup_request_state(client, ref)
+            except Exception:
+                pass
 
 
 def _get_confidence(extracted_json: str) -> float:
@@ -440,7 +737,10 @@ async def _confirm_pending(pending_id: int, db_user) -> str:
     if not indexed:
         indexed = DatabaseService.reindex_document_vector(doc.id, doc.user_id)
     note = " Indexed for search." if indexed else " Saved, but vector indexing failed."
-    nlp_service_v2._add_to_history(doc.user_id, f"Confirmed WhatsApp upload {pending_id}.", pending.extracted_data or "")
+    vendor = doc.vendor_name or doc.title or "Unknown vendor"
+    amount = f"₹{doc.total_amount:,.2f}" if doc.total_amount else "N/A"
+    history_note = f"Saved receipt from {vendor}, amount {amount}, document ID {doc.id}."
+    nlp_service_v2._add_to_history(doc.user_id, f"Confirmed WhatsApp upload {pending_id}.", history_note)
     return f"Document saved. ID: {doc.id}.{note}"
 
 
@@ -503,7 +803,28 @@ async def whatsapp_webhook(request: Request) -> Response:
             )
 
         if media_count > 0:
-            return _cacheable_xml_response(message_sid, await _handle_media_upload(form, db_user))
+            # Avoid Twilio webhook timeout: process asynchronously and send ONE final aggregated message via REST.
+            request_id = message_sid or uuid.uuid4().hex
+            _cacheable_xml_response(message_sid)  # populate cache to prevent duplicate retries scheduling
+            asyncio.create_task(
+                _process_media_request_and_send(
+                    from_value=from_value,
+                    from_number=from_number,
+                    request_id=request_id,
+                    message_sid=message_sid,
+                    form=form,
+                    db_user=db_user,
+                )
+            )
+            return _cacheable_xml_response(message_sid)
+
+        async def _background_answer_and_send(user_text: str, *, log_prefix: str) -> None:
+            try:
+                answer = await _answer_user_question(db_user, user_text, log_prefix=log_prefix)
+                await _send_whatsapp_message(from_value, answer)
+                logger.info("WhatsApp async answer sent sid=%s prefix=%s", message_sid or "-", log_prefix)
+            except Exception:
+                logger.exception("WhatsApp async answer failed sid=%s prefix=%s", message_sid or "-", log_prefix)
 
         confirm_match = re.match(r"^(?:confirm|save)\s+(\d+)\s*$", body, flags=re.IGNORECASE)
         if confirm_match:
@@ -533,11 +854,17 @@ async def whatsapp_webhook(request: Request) -> Response:
             query = body[2:].strip()
             if not query:
                 return _cacheable_xml_response(message_sid, "Please send /q followed by your question.")
-            return _cacheable_xml_response(message_sid, await _answer_user_question(db_user, query, log_prefix="/q"))
+            # Avoid Twilio webhook timeout by replying via REST asynchronously.
+            _cacheable_xml_response(message_sid)  # populate cache to prevent duplicate retries scheduling
+            asyncio.create_task(_background_answer_and_send(query, log_prefix="/q"))
+            return _cacheable_xml_response(message_sid)
         if not body:
             return _cacheable_xml_response(message_sid, _help_text())
 
-        return _cacheable_xml_response(message_sid, await _answer_user_question(db_user, body, log_prefix="normal"))
+        # Normal chat: avoid webhook timeouts (especially under 429 retries) by sending answer via REST asynchronously.
+        _cacheable_xml_response(message_sid)  # populate cache to prevent duplicate retries scheduling
+        asyncio.create_task(_background_answer_and_send(body, log_prefix="normal"))
+        return _cacheable_xml_response(message_sid)
     except Exception:
         logger.exception("WhatsApp webhook failed for %s", from_number)
         return _cacheable_xml_response(message_sid, "Sorry, I could not process that just now. Please try again.")

@@ -112,44 +112,68 @@ class VectorService:
             parts.append(f"{prefix}: {data}")
         return parts
 
+    _FLATTEN_SKIP_PREFIXES = (
+        "confidence.",
+        "display_card",
+        "_ocr_metadata",
+    )
+
     def _document_to_text(self, doc: Dict[str, Any]) -> str:
-        """Convert document data to searchable text."""
+        """Convert document data to rich searchable text for embeddings (full OCR payload)."""
         parts = []
 
-        # Add title
-        if doc.get('title'):
+        if doc.get("title"):
             parts.append(f"Title: {doc['title']}")
 
-        if doc.get('expense_category'):
+        if doc.get("expense_category"):
             parts.append(f"Category: {doc['expense_category']}")
 
-        # Add document type
-        if doc.get('document_type'):
+        if doc.get("document_type"):
             parts.append(f"Type: {doc['document_type']}")
 
-        # Add vendor
-        if doc.get('vendor_name'):
+        if doc.get("vendor_name"):
             parts.append(f"Vendor: {doc['vendor_name']}")
 
-        # Add amount
-        if doc.get('total_amount'):
+        if doc.get("total_amount"):
             parts.append(f"Amount: {doc['total_amount']}")
 
-        # Add extracted JSON content if available (including nested fields)
-        if doc.get('extracted_json'):
-            try:
-                data = json.loads(doc['extracted_json'])
-                flattened = self._flatten_json_for_search(data)
-                # Skip noisy OCR confidence/table blobs but keep business fields like address/location/items.
-                flattened = [
-                    line for line in flattened
-                    if not line.startswith("confidence") and not line.startswith("tables")
-                ]
-                parts.extend(flattened)
-            except json.JSONDecodeError:
-                pass
+        if doc.get("document_date"):
+            parts.append(f"Receipt date: {doc['document_date']}")
 
-        return " | ".join(parts) if parts else "Untitled Document"
+        if doc.get("user_input_text"):
+            parts.append(f"User note: {doc['user_input_text']}")
+
+        if doc.get("status") == "pending":
+            parts.append("Status: pending (not yet confirmed)")
+
+        raw = (doc.get("raw_text") or "").strip()
+        if raw:
+            parts.append(f"Raw receipt OCR: {raw}")
+
+        extracted = doc.get("extracted_json")
+        if extracted:
+            try:
+                data = json.loads(extracted) if isinstance(extracted, str) else extracted
+                if isinstance(data, dict):
+                    flattened = self._flatten_json_for_search(data)
+                    flattened = [
+                        line
+                        for line in flattened
+                        if not any(line.startswith(prefix) for prefix in self._FLATTEN_SKIP_PREFIXES)
+                    ]
+                    parts.extend(flattened)
+                    parts.append(
+                        "Full OCR JSON: "
+                        + json.dumps(data, ensure_ascii=False, default=str)
+                    )
+                elif data is not None:
+                    parts.append(f"Extracted data: {data}")
+            except (json.JSONDecodeError, TypeError):
+                if isinstance(extracted, str) and extracted.strip():
+                    parts.append(f"Extracted OCR text: {extracted.strip()}")
+
+        text = " | ".join(parts) if parts else "Untitled Document"
+        return text[:8000]
 
     def add_document(self, doc_id: int, user_id: int, doc_data: Dict[str, Any]) -> bool:
         """
@@ -217,6 +241,50 @@ class VectorService:
 
         except Exception as e:
             logger.error(f"Failed to add document {doc_id} to vector DB: {e}")
+            return False
+
+    def add_pending_document(self, pending_id: int, user_id: int, doc_data: Dict[str, Any]) -> bool:
+        """Embed OCR-extracted pending upload so Q&A works before CONFIRM."""
+        try:
+            payload = {**doc_data, "status": "pending"}
+            text = self._document_to_text(payload)
+            embedding = self._generate_embedding(text)
+            vector_id = f"pending_{int(pending_id)}"
+            uid = int(user_id)
+            meta_base = {
+                "user_id": uid,
+                "pending_id": int(pending_id),
+                "doc_id": -int(pending_id),
+                "type": "pending_document",
+                "text": text[:1000],
+            }
+            username = (doc_data.get("username") or "").strip()
+            if username:
+                meta_base["username"] = username[:255]
+            ec = doc_data.get("expense_category")
+            if ec:
+                meta_base["expense_category"] = str(ec)[:80]
+
+            self.collection.upsert(
+                ids=[vector_id],
+                embeddings=[embedding],
+                metadatas=[meta_base],
+                documents=[text],
+            )
+            logger.info("Added pending document %s to vector DB for user %s", pending_id, user_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to add pending document %s to vector DB: %s", pending_id, e)
+            return False
+
+    def delete_pending_document(self, pending_id: int) -> bool:
+        """Remove pending OCR embedding after confirm or discard."""
+        try:
+            self.collection.delete(ids=[f"pending_{int(pending_id)}"])
+            logger.info("Deleted pending document %s from vector DB", pending_id)
+            return True
+        except Exception as e:
+            logger.error("Failed to delete pending document %s from vector DB: %s", pending_id, e)
             return False
 
     def add_user_text_entry(

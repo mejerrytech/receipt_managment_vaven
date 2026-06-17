@@ -876,6 +876,60 @@ class DatabaseService:
             db.close()
 
     @staticmethod
+    def _vendor_name_from_ocr_data(data: Any) -> Optional[str]:
+        """Read vendor name from OCR JSON (nested or flat Gemini schema)."""
+        if not isinstance(data, dict):
+            return None
+        vendor = data.get("vendor_or_sender")
+        if isinstance(vendor, dict):
+            name = DatabaseService._normalize_text(vendor.get("name"))
+            if name:
+                return name
+        for key in ("vendor", "vendor_name"):
+            flat_vendor = data.get(key)
+            if isinstance(flat_vendor, str):
+                name = DatabaseService._normalize_text(flat_vendor)
+                if name:
+                    return name
+        return None
+
+    @staticmethod
+    def backfill_document_vendor_names(user_id: int) -> int:
+        """Populate documents.vendor_name from OCR JSON when the column is empty."""
+        db = get_db()
+        updated = 0
+        try:
+            docs = (
+                db.query(Document)
+                .filter(Document.user_id == user_id)
+                .filter(or_(Document.vendor_name.is_(None), Document.vendor_name == ""))
+                .filter(Document.extracted_data.isnot(None))
+                .all()
+            )
+            for doc in docs:
+                try:
+                    parsed = json.loads(doc.extracted_data) if doc.extracted_data else {}
+                except Exception:
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                name = DatabaseService._vendor_name_from_ocr_data(parsed)
+                if not name:
+                    continue
+                doc.vendor_name = name
+                updated += 1
+            if updated:
+                db.commit()
+                logger.info("Backfilled vendor_name for %s document(s), user_id=%s", updated, user_id)
+            return updated
+        except Exception as e:
+            db.rollback()
+            logger.error("backfill_document_vendor_names failed: %s", e)
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
     def save_document(user_id: int, file_name: Optional[str], mime_type: Optional[str],
                       file_size: Optional[int], extracted_json: str,
                       raw_text: Optional[str] = None,
@@ -896,9 +950,18 @@ class DatabaseService:
 
             # Extract key fields for denormalized columns
             amounts = data.get("amounts", {})
-            vendor = data.get("vendor_or_sender", {})
-            identifiers = data.get("identifiers", {})
-            confidence = data.get("confidence", {})
+            vendor = data.get("vendor_or_sender", {}) if isinstance(data.get("vendor_or_sender"), dict) else {}
+            identifiers = data.get("identifiers", {}) if isinstance(data.get("identifiers"), dict) else {}
+            confidence = data.get("confidence", {}) if isinstance(data.get("confidence"), dict) else {}
+            vendor_name = DatabaseService._vendor_name_from_ocr_data(data)
+            if not vendor_name and isinstance(vendor, dict):
+                vendor_name = DatabaseService._normalize_text(vendor.get("name"))
+            total_amount = amounts.get("total")
+            if total_amount is None and data.get("total_amount") is not None:
+                total_amount = data.get("total_amount")
+            currency = amounts.get("currency") or data.get("currency")
+            invoice_number = identifiers.get("invoice_number") or data.get("bill_number")
+            gstin = identifiers.get("gstin") or data.get("gstin")
             merged_input_text = " ".join([x for x in [raw_text, user_input_text] if x]).strip() or None
             classified_category = DatabaseService._infer_document_expense_category(
                 data, merged_input_text, file_name
@@ -920,11 +983,11 @@ class DatabaseService:
                 document_type=data.get("document_type"),
                 title=data.get("title"),
                 document_date=data.get("date"),
-                total_amount=amounts.get("total"),
-                currency=amounts.get("currency"),
-                vendor_name=vendor.get("name"),
-                invoice_number=identifiers.get("invoice_number"),
-                gstin=identifiers.get("gstin"),
+                total_amount=total_amount,
+                currency=currency,
+                vendor_name=vendor_name,
+                invoice_number=invoice_number,
+                gstin=gstin,
                 expense_category=classified_category,
                 user_input_text=user_input_text,
                 confidence_overall=confidence.get("overall"),
@@ -1218,19 +1281,42 @@ class DatabaseService:
 
     @staticmethod
     def get_distinct_vendor_names(user_id: int, limit: int = 500) -> List[str]:
-        """Distinct vendor names for a user (helper for NLP user_info replies)."""
+        """Distinct vendor names for a user (vendor_name column + OCR JSON fallback)."""
+        DatabaseService.backfill_document_vendor_names(user_id)
         db = get_db()
         try:
-            rows = (
-                db.query(Document.vendor_name)
-                .filter(Document.user_id == user_id, Document.vendor_name.isnot(None))
-                .distinct()
-                .limit(limit)
+            docs = (
+                db.query(Document)
+                .filter(Document.user_id == user_id)
+                .order_by(Document.created_at.desc())
+                .limit(2000)
                 .all()
             )
-            return [r[0] for r in rows if r and r[0]]
+            names: dict[str, str] = {}
+            for doc in docs:
+                label = (doc.vendor_name or "").strip()
+                if not label and doc.extracted_data:
+                    try:
+                        parsed = json.loads(doc.extracted_data)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        label = DatabaseService._vendor_name_from_ocr_data(parsed) or ""
+                if not label and doc.title:
+                    label = str(doc.title).strip()
+                if label:
+                    key = label.lower()
+                    if key not in names:
+                        names[key] = label
+                if len(names) >= limit:
+                    break
+            return list(names.values())[:limit]
         finally:
             db.close()
+
+    @staticmethod
+    def count_unique_vendors_for_user(user_id: int) -> int:
+        return len(DatabaseService.get_distinct_vendor_names(user_id))
 
     @staticmethod
     def get_user_summary_stats(user_id: int) -> dict:
@@ -1257,10 +1343,7 @@ class DatabaseService:
             ).group_by(Document.document_type).all()
 
             # Vendor count (unique vendors)
-            vendor_count = db.query(func.count(func.distinct(Document.vendor_name))).filter(
-                Document.user_id == user_id,
-                Document.vendor_name.isnot(None)
-            ).scalar() or 0
+            vendor_count = DatabaseService.count_unique_vendors_for_user(user_id)
 
             # Recent documents (last 5)
             recent_docs = db.query(Document).filter(
@@ -1629,16 +1712,27 @@ class DatabaseService:
 
         amounts = data.get("amounts") or {}
         vendor = data.get("vendor_or_sender") or {}
+        if not isinstance(vendor, dict):
+            vendor = {}
         identifiers = data.get("identifiers") or {}
+        if not isinstance(identifiers, dict):
+            identifiers = {}
 
         total_amount = amounts.get("total")
-        try:
-            total_amount = float(total_amount) if total_amount is not None else None
-        except Exception:
-            total_amount = None
+        if total_amount is None and data.get("total_amount") is not None:
+            try:
+                total_amount = float(data.get("total_amount"))
+            except Exception:
+                total_amount = None
+        else:
+            try:
+                total_amount = float(total_amount) if total_amount is not None else None
+            except Exception:
+                total_amount = None
 
         return {
-            "vendor_name": DatabaseService._normalize_text(vendor.get("name")),
+            "vendor_name": DatabaseService._vendor_name_from_ocr_data(data)
+            or DatabaseService._normalize_text(vendor.get("name")),
             "invoice_number": DatabaseService._normalize_text(identifiers.get("invoice_number")),
             "date": DatabaseService._normalize_text(data.get("date")),
             "title": DatabaseService._normalize_text(data.get("title")),

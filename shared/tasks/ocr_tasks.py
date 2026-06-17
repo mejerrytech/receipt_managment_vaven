@@ -164,6 +164,26 @@ def process_pending_ocr(self, pending_id: int, user_id: int):
 
     try:
         result = _run(_extract_from_telegram_file(pending.telegram_file_id, pending.mime_type))
+
+        # Gemini unreadable-image guard
+        try:
+            import json as _json_check
+            _result_check = _json_check.loads(result)
+            if _result_check.get("status") == "unreadable":
+                unreadable_msg = _result_check.get(
+                    "message",
+                    "I couldn't clearly understand the uploaded image. Please re-upload a clearer image.",
+                )
+                db_service.mark_pending_ocr_failed(
+                    pending_id,
+                    f"Unreadable image: {unreadable_msg}",
+                    retry_count=self.request.retries,
+                )
+                _send_telegram_info(pending.telegram_chat_id, unreadable_msg)
+                return {"success": False, "reason": "unreadable_image"}
+        except Exception:
+            pass  # If JSON parse fails here, fall through to normal duplicate/confidence flow
+
         duplicate_after_ocr = db_service.find_duplicate_by_extracted_fingerprint(user_id, result)
         if duplicate_after_ocr:
             db_service.mark_pending_ocr_failed(
