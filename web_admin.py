@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
+from uuid import UUID
 from fastapi import FastAPI, Request, Query, HTTPException, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 
@@ -19,6 +20,8 @@ from shared.nlp_sql_service import get_nlp_sql_service
 from shared.ocr_service import get_ocr_service
 # Import database service
 from shared.database import DatabaseService, engine, init_db, DATABASE_URL
+from shared.id_types import as_str
+from api.review.utils.images import find_review_image, save_review_image
 
 app = FastAPI(title="Bot Admin Panel")
 
@@ -58,7 +61,7 @@ def get_users():
 
         return [
             {
-                "id": row["id"],
+                "id": as_str(row["id"]),
                 "telegram_id": row["telegram_id"],
                 "name": f"{row['first_name'] or ''} {row['last_name'] or ''}".strip() or "Unknown",
                 "username": row["username"],
@@ -92,8 +95,8 @@ def get_documents(limit: int = 100):
                     extracted_data = {"error": "Invalid JSON"}
 
             result.append({
-                "id": row["id"],
-                "user_id": row["user_id"],
+                "id": as_str(row["id"]),
+                "user_id": as_str(row["user_id"]),
                 "user_telegram_id": row["telegram_id"],
                 "user_username": row["username"],
                 "file_name": row["file_name"],
@@ -141,7 +144,7 @@ class DocumentCategoryUpdate(BaseModel):
 
 
 @app.patch("/api/documents/{doc_id}/category")
-def patch_document_category(doc_id: int, body: DocumentCategoryUpdate):
+def patch_document_category(doc_id: UUID, body: DocumentCategoryUpdate):
     if current_session["user_id"] is None:
         raise HTTPException(status_code=400, detail="No user selected")
     doc = DatabaseService.update_document_expense_category(
@@ -149,7 +152,7 @@ def patch_document_category(doc_id: int, body: DocumentCategoryUpdate):
     )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    return {"success": True, "id": doc.id, "expense_category": doc.expense_category}
+    return {"success": True, "id": as_str(doc.id), "expense_category": doc.expense_category}
 
 
 @app.get("/api/stats")
@@ -212,7 +215,7 @@ class ChatRequest(BaseModel):
 
 
 class SetUserRequest(BaseModel):
-    user_id: int
+    user_id: UUID
 
 
 @app.post("/api/set-user")
@@ -235,7 +238,7 @@ def set_current_user(request: SetUserRequest):
 
         return {
             "success": True,
-            "user_id": user["id"],
+            "user_id": as_str(user["id"]),
             "user_name": user_name,
             "message": f"Now viewing data for {user_name}"
         }
@@ -372,6 +375,7 @@ async def upload_file(file: UploadFile = File(...)):
             confidence_overall=confidence,
             source='web'
         )
+        save_review_image(pending.id, file_bytes, file.content_type)
 
         return UploadResponse(
             success=True,
@@ -410,6 +414,25 @@ def get_pending_document(token: str):
         raise HTTPException(status_code=403, detail="Access denied")
     
     return pending.to_dict()
+
+
+@app.get("/api/pending/{token}/image")
+def get_pending_image(token: str):
+    """Serve receipt image for a pending document."""
+    import mimetypes
+
+    pending = DatabaseService.get_pending_document_by_token(token)
+    if not pending:
+        raise HTTPException(status_code=404, detail="Pending document not found or expired")
+    if pending.user_id != current_session["user_id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    local = find_review_image(pending.id)
+    if not local or not local.is_file():
+        raise HTTPException(status_code=404, detail="Receipt image not found")
+
+    mime = pending.mime_type or mimetypes.guess_type(local.name)[0] or "image/jpeg"
+    return FileResponse(local, media_type=mime)
 
 
 class ConfirmRequest(BaseModel):
@@ -522,6 +545,7 @@ def dashboard(request: Request):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bot Admin Panel - AI Assistant</title>
+    <meta name="ui-version" content="expensebot-image-v3">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -960,6 +984,416 @@ def dashboard(request: Request):
         @media (max-width: 900px) {
             .visual-grid { grid-template-columns: 1fr; }
         }
+
+        /* ExpenseBot WhatsApp Review UI */
+        .wa-flow-section {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 2px 12px rgba(15, 23, 42, 0.08);
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .wa-flow-section h2 {
+            font-size: 1.125rem;
+            margin-bottom: 0.35rem;
+            color: #0f172a;
+        }
+        .wa-flow-section p {
+            color: #64748b;
+            font-size: 0.875rem;
+            margin-bottom: 1.25rem;
+        }
+        .wa-showcase {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(240px, 1fr));
+            gap: 1.25rem;
+        }
+        @media (max-width: 1100px) {
+            .wa-showcase { grid-template-columns: 1fr; }
+        }
+        .wa-phone {
+            background: #111b21;
+            border-radius: 28px;
+            padding: 10px;
+            box-shadow: 0 20px 50px rgba(15, 23, 42, 0.22);
+            max-width: 320px;
+            margin: 0 auto;
+        }
+        .wa-phone-screen {
+            background: #efeae2;
+            border-radius: 22px;
+            overflow: hidden;
+            min-height: 520px;
+            display: flex;
+            flex-direction: column;
+        }
+        .wa-topbar {
+            background: #075e54;
+            color: #fff;
+            padding: 0.65rem 0.85rem;
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+        .wa-topbar .wa-avatar {
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #25d366, #128c7e);
+            display: grid;
+            place-items: center;
+            font-size: 1rem;
+        }
+        .wa-topbar .wa-verified {
+            color: #53bdeb;
+            font-size: 0.75rem;
+            margin-left: 0.15rem;
+        }
+        .wa-chat {
+            flex: 1;
+            padding: 0.75rem;
+            overflow-y: auto;
+            background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23d9d0c3' fill-opacity='0.35'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E") #e5ddd5;
+        }
+        .wa-msg-user {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 0.65rem;
+        }
+        .wa-msg-bot { margin-bottom: 0.65rem; }
+        .wa-bubble-user {
+            background: #d9fdd3;
+            border-radius: 10px 10px 2px 10px;
+            padding: 0.35rem;
+            max-width: 78%;
+            box-shadow: 0 1px 1px rgba(0,0,0,0.08);
+        }
+        .wa-thumb {
+            width: 100%;
+            height: 110px;
+            border-radius: 8px;
+            background: linear-gradient(145deg, #f8fafc, #e2e8f0);
+            display: grid;
+            place-items: center;
+            color: #64748b;
+            font-size: 2rem;
+            object-fit: cover;
+        }
+        .wa-bubble-bot {
+            background: #fff;
+            border-radius: 10px 10px 10px 2px;
+            padding: 0.75rem;
+            max-width: 92%;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            font-size: 0.8rem;
+            line-height: 1.45;
+        }
+        .wa-bot-intro {
+            color: #334155;
+            margin-bottom: 0.55rem;
+            font-size: 0.78rem;
+        }
+        .wa-confidence {
+            border-radius: 10px;
+            padding: 0.55rem 0.65rem;
+            margin-bottom: 0.6rem;
+            font-size: 0.72rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .wa-confidence.green { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+        .wa-confidence.amber { background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }
+        .wa-confidence.red { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+        .wa-tier-msg {
+            font-size: 0.76rem;
+            color: #475569;
+            margin-bottom: 0.55rem;
+        }
+        .wa-expense-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.72rem;
+            margin-bottom: 0.45rem;
+        }
+        .wa-expense-table th {
+            text-align: left;
+            color: #64748b;
+            font-weight: 600;
+            padding: 0.25rem 0;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .wa-expense-table td {
+            padding: 0.35rem 0;
+            border-bottom: 1px solid #f1f5f9;
+            color: #0f172a;
+        }
+        .wa-expense-table .amt { text-align: right; font-weight: 600; white-space: nowrap; }
+        .wa-expense-table .uncertain { color: #b45309; font-weight: 600; }
+        .wa-expense-table .unknown { color: #b91c1c; font-weight: 600; }
+        .wa-total-row {
+            display: flex;
+            justify-content: space-between;
+            font-weight: 700;
+            font-size: 0.8rem;
+            padding-top: 0.35rem;
+            margin-top: 0.15rem;
+            border-top: 2px solid #e2e8f0;
+        }
+        .wa-total-row.green { color: #047857; }
+        .wa-total-row.amber { color: #b45309; }
+        .wa-total-row.red { color: #b91c1c; }
+        .wa-cta-stack { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.55rem; }
+        .wa-cta {
+            border: none;
+            border-radius: 8px;
+            padding: 0.55rem 0.65rem;
+            font-size: 0.76rem;
+            font-weight: 600;
+            cursor: pointer;
+            text-align: center;
+            transition: opacity 0.15s;
+        }
+        .wa-cta:hover { opacity: 0.92; }
+        .wa-cta.primary-green { background: #059669; color: #fff; }
+        .wa-cta.primary-amber { background: #d97706; color: #fff; }
+        .wa-cta.primary-red { background: #dc2626; color: #fff; }
+        .wa-cta.secondary { background: #fff; color: #334155; border: 1px solid #cbd5e1; }
+        .wa-cta.danger { background: #fff; color: #dc2626; border: 1px solid #fecaca; }
+        .wa-cta.disabled {
+            background: #f1f5f9;
+            color: #94a3b8;
+            border: 1px solid #e2e8f0;
+            cursor: not-allowed;
+        }
+        .wa-composer {
+            background: #f0f2f5;
+            padding: 0.45rem 0.6rem;
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            color: #94a3b8;
+            font-size: 0.75rem;
+        }
+        .wa-composer .wa-mic {
+            margin-left: auto;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #25d366;
+            display: grid;
+            place-items: center;
+            color: #fff;
+            font-size: 0.8rem;
+        }
+        .wa-screen-label {
+            text-align: center;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-top: 0.65rem;
+        }
+        .wa-screen-label.green { color: #059669; }
+        .wa-screen-label.amber { color: #d97706; }
+        .wa-screen-label.red { color: #dc2626; }
+        .wa-pending-card {
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 0.75rem;
+            cursor: pointer;
+            transition: box-shadow 0.15s, border-color 0.15s;
+            background: #fff;
+        }
+        .wa-pending-card:hover {
+            border-color: #94a3b8;
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+        }
+        .wa-pending-tier {
+            display: inline-block;
+            padding: 0.2rem 0.55rem;
+            border-radius: 999px;
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+        .wa-pending-tier.green { background: #ecfdf5; color: #047857; }
+        .wa-pending-tier.amber { background: #fffbeb; color: #b45309; }
+        .wa-pending-tier.red { background: #fef2f2; color: #b91c1c; }
+        #review-modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.72);
+            z-index: 9999;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            backdrop-filter: blur(4px);
+        }
+        #review-modal .wa-modal-wrap {
+            position: relative;
+            max-width: 380px;
+            width: 100%;
+            max-height: 96vh;
+            overflow-y: auto;
+        }
+        #review-modal .wa-modal-close {
+            position: absolute;
+            top: -2.5rem;
+            right: 0;
+            background: rgba(255,255,255,0.95);
+            border: none;
+            border-radius: 50%;
+            width: 36px;
+            height: 36px;
+            font-size: 1.25rem;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+        #review-edit-drawer {
+            display: none;
+            margin-top: 0.75rem;
+            background: #fff;
+            border-radius: 14px;
+            padding: 1rem;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.15);
+        }
+        #review-edit-drawer.open { display: block; }
+        #review-edit-panel { display: none; }
+
+        .pending-receipt-list { display: flex; flex-direction: column; gap: 0.75rem; }
+        .pending-receipt-item {
+            display: flex;
+            gap: 0.85rem;
+            padding: 0.75rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            cursor: pointer;
+            background: #fff;
+            transition: box-shadow 0.15s, border-color 0.15s;
+            align-items: stretch;
+        }
+        .pending-receipt-item:hover {
+            border-color: #94a3b8;
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+        }
+        .pending-receipt-thumb {
+            position: relative;
+            width: 72px;
+            min-width: 72px;
+            height: 72px;
+            border-radius: 10px;
+            overflow: hidden;
+            background: #f1f5f9;
+            border: 2px solid #e2e8f0;
+        }
+        .pending-receipt-thumb.green { border-color: #34d399; }
+        .pending-receipt-thumb.amber { border-color: #fbbf24; }
+        .pending-receipt-thumb.red { border-color: #f87171; }
+        .pending-receipt-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+        .pending-receipt-thumb.no-image img { display: none; }
+        .pending-thumb-fallback {
+            display: none;
+            width: 100%;
+            height: 100%;
+            place-items: center;
+            font-size: 1.75rem;
+            background: #f8fafc;
+        }
+        .pending-receipt-thumb.no-image .pending-thumb-fallback { display: grid; }
+        .pending-tier-pill {
+            position: absolute;
+            bottom: 4px;
+            left: 4px;
+            right: 4px;
+            text-align: center;
+            font-size: 0.62rem;
+            font-weight: 700;
+            padding: 0.1rem 0.2rem;
+            border-radius: 4px;
+            color: #fff;
+        }
+        .pending-tier-pill.green { background: rgba(5, 150, 105, 0.92); }
+        .pending-tier-pill.amber { background: rgba(217, 119, 6, 0.92); }
+        .pending-tier-pill.red { background: rgba(220, 38, 38, 0.92); }
+        .pending-receipt-info { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+        .pending-receipt-title {
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: #0f172a;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .pending-receipt-meta {
+            font-size: 0.78rem;
+            color: #64748b;
+            margin-top: 0.25rem;
+        }
+
+        .review-confidence-card {
+            background: #fff;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+            border: 3px solid #e2e8f0;
+        }
+        .review-confidence-card.green { border-color: #10b981; }
+        .review-confidence-card.amber { border-color: #f59e0b; }
+        .review-confidence-card.red { border-color: #ef4444; }
+        .review-conf-banner {
+            padding: 0.65rem 1rem;
+            font-size: 0.8rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+        }
+        .review-conf-banner.green { background: #ecfdf5; color: #047857; }
+        .review-conf-banner.amber { background: #fffbeb; color: #b45309; }
+        .review-conf-banner.red { background: #fef2f2; color: #b91c1c; }
+        .review-conf-message {
+            padding: 0 1rem 0.65rem;
+            font-size: 0.78rem;
+            color: #475569;
+            margin: 0;
+        }
+        .review-image-frame {
+            background: #0f172a;
+            min-height: 280px;
+            max-height: 62vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .review-receipt-image {
+            width: 100%;
+            max-height: 62vh;
+            object-fit: contain;
+            display: block;
+        }
+        .review-pdf-placeholder {
+            color: #94a3b8;
+            font-size: 1rem;
+            padding: 3rem;
+            text-align: center;
+        }
+        .review-confidence-card .wa-cta-stack {
+            padding: 0.85rem 1rem 1rem;
+            background: #f8fafc;
+        }
+        #review-modal .wa-modal-wrap { max-width: 420px; }
     </style>
 </head>
 <body>
@@ -1050,7 +1484,7 @@ def dashboard(request: Request):
 
         <!-- Pending Review Tab -->
         <div id="pending-tab" class="tab-content">
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
+            <div style="display: grid; grid-template-columns: 1fr 1.2fr; gap: 2rem;">
                 <!-- Upload Section -->
                 <div class="table-container">
                     <h3 style="padding: 1.5rem; border-bottom: 1px solid #e0e0e0; margin: 0;">📤 Upload Document</h3>
@@ -1074,18 +1508,12 @@ def dashboard(request: Request):
                 </div>
             </div>
 
-            <!-- Document Review Modal -->
-            <div id="review-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
-                <div style="background: white; border-radius: 12px; max-width: 800px; width: 90%; max-height: 90vh; overflow: auto; padding: 2rem;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-                        <h3 style="margin: 0;">📄 Review Document</h3>
-                        <button onclick="closeReviewModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer;">&times;</button>
-                    </div>
+            <!-- Document Review Modal (WhatsApp-style) -->
+            <div id="review-modal">
+                <div class="wa-modal-wrap">
+                    <button type="button" class="wa-modal-close" onclick="closeReviewModal()" aria-label="Close">&times;</button>
                     <div id="review-content"></div>
-                    <div style="display: flex; gap: 1rem; margin-top: 1.5rem; justify-content: flex-end;">
-                        <button onclick="cancelPending()" style="padding: 0.75rem 1.5rem; background: #f44336; color: white; border: none; border-radius: 8px; cursor: pointer;">Cancel</button>
-                        <button onclick="savePending()" style="padding: 0.75rem 1.5rem; background: #4caf50; color: white; border: none; border-radius: 8px; cursor: pointer;">Save Document</button>
-                    </div>
+                    <div id="review-edit-drawer"></div>
                 </div>
             </div>
         </div>
@@ -1148,6 +1576,10 @@ def dashboard(request: Request):
         let expenseCategories = [];
         const dashboardPalette = ['#3b82f6', '#f97316', '#8b5cf6', '#06b6d4', '#ef4444', '#eab308'];
 
+        function categoryName(c) {
+            return typeof c === 'string' ? c : (c && c.name ? c.name : String(c));
+        }
+
         async function loadExpenseCategories() {
             try {
                 const res = await fetch('/api/expense-categories');
@@ -1157,7 +1589,7 @@ def dashboard(request: Request):
                 if (filter) {
                     const current = filter.value;
                     filter.innerHTML = '<option value="">All categories</option>' +
-                        expenseCategories.map(c => `<option value="${c}">${c}</option>`).join('');
+                        expenseCategories.map(c => `<option value="${categoryName(c)}">${categoryName(c)}</option>`).join('');
                     if (current) filter.value = current;
                 }
             } catch (e) {
@@ -1219,7 +1651,7 @@ def dashboard(request: Request):
                 const res = await fetch(\'/api/set-user\', {
                     method: \'POST\',
                     headers: { \'Content-Type\': \'application/json\' },
-                    body: JSON.stringify({ user_id: parseInt(userId) })
+                    body: JSON.stringify({ user_id: userId })
                 });
 
                 const data = await res.json();
@@ -1522,7 +1954,7 @@ def dashboard(request: Request):
                     const typeLabel = d.document_type || (d.source === \'text\' ? \'text_entry\' : \'-\');
                     const categorySelect = d.source === \'document\'
                         ? `<select onchange="updateDocumentCategory(${d.id}, this.value)" style="font-size:0.75rem;padding:0.25rem;border-radius:6px;max-width:160px;">
-                            ${expenseCategories.map(c => `<option value="${c}" ${c === d.expense_category ? \'selected\' : \'\'}>${c}</option>`).join(\'\')}
+                            ${expenseCategories.map(c => `<option value="${categoryName(c)}" ${categoryName(c) === d.expense_category ? \'selected\' : \'\'}>${categoryName(c)}</option>`).join(\'\')}
                            </select>`
                         : `<span class="badge badge-category">${d.expense_category || \'Other\'}</span>`;
 
@@ -1580,6 +2012,118 @@ def dashboard(request: Request):
         loadUsers();
         checkCurrentUser();
         loadDocuments();
+
+        // ============== EXPENSEBOT REVIEW UI ==============
+        function confidenceUi(score) {
+            const pct = Math.round((score || 0) * 100);
+            if (pct >= 90) {
+                return {
+                    tier: 'green',
+                    pct,
+                    label: 'High',
+                    message: 'We extracted your expenses with high confidence.',
+                    icon: '✓',
+                };
+            }
+            if (pct >= 60) {
+                return {
+                    tier: 'amber',
+                    pct,
+                    label: 'Medium',
+                    message: 'Some fields may require verification.',
+                    icon: '⚠',
+                };
+            }
+            return {
+                tier: 'red',
+                pct,
+                label: 'Low',
+                message: 'We could not confidently extract all expense details.',
+                icon: '✕',
+            };
+        }
+
+        function formatWaINR(val) {
+            if (val == null || val === '' || Number.isNaN(Number(val))) return '—';
+            return '₹' + Number(val).toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+        }
+
+        function waCtaHtml(tier, interactive) {
+            const click = (fn) => interactive ? `onclick="${fn}"` : '';
+            if (tier === 'green') {
+                return `<div class="wa-cta-stack">
+                    <button type="button" class="wa-cta primary-green" ${click('savePending()')}>✓ Approve All</button>
+                    <button type="button" class="wa-cta secondary" ${click('toggleReviewEditPanel()')}>✏ Edit</button>
+                </div>`;
+            }
+            if (tier === 'amber') {
+                return `<div class="wa-cta-stack">
+                    <button type="button" class="wa-cta primary-amber" ${click('savePending()')}>👁 Review &amp; Approve</button>
+                    <button type="button" class="wa-cta secondary" ${click('toggleReviewEditPanel()')}>✏ Edit Details</button>
+                    <button type="button" class="wa-cta danger" ${click('cancelPending()')}>✖ Reject</button>
+                </div>`;
+            }
+            return `<div class="wa-cta-stack">
+                <button type="button" class="wa-cta primary-red" ${click('toggleReviewEditPanel(true)')}>✏ Review &amp; Correct</button>
+                <button type="button" class="wa-cta disabled" disabled>Cannot Confirm</button>
+                <button type="button" class="wa-cta danger" ${click('cancelPending()')}>✖ Reject</button>
+            </div>`;
+        }
+
+        function buildConfidenceImageCard(pending, conf, imageUrl) {
+            const isPdf = (pending.mime_type || '').includes('pdf');
+            const imageBlock = isPdf
+                ? '<div class="review-pdf-placeholder">📄 PDF — open edit to review details</div>'
+                : `<img class="review-receipt-image" src="${imageUrl}" alt="Receipt" />`;
+            return `
+                <div class="review-confidence-card ${conf.tier}">
+                    <div class="review-conf-banner ${conf.tier}">
+                        <span>${conf.icon}</span>
+                        <span>Extraction Confidence ${conf.pct}% (${conf.label})</span>
+                    </div>
+                    <p class="review-conf-message">${conf.message}</p>
+                    <div class="review-image-frame">${imageBlock}</div>
+                    ${waCtaHtml(conf.tier, true)}
+                </div>`;
+        }
+
+        function pendingImageUrl(token) {
+            return `/api/pending/${token}/image`;
+        }
+
+        function toggleReviewEditPanel(forceOpen) {
+            const panel = document.getElementById('review-edit-drawer');
+            if (!panel) return;
+            const open = forceOpen === true || !panel.classList.contains('open');
+            panel.classList.toggle('open', open);
+            if (open) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+
+        function buildReviewEditDrawerHtml(pending, ext, currentCat, paymentVal, openByDefault) {
+            const cats = Array.isArray(expenseCategories) ? expenseCategories : [];
+            const catSelectHtml = cats.map(c =>
+                `<option value="${categoryName(c)}" ${categoryName(c) === currentCat ? 'selected' : ''}>${categoryName(c)}</option>`
+            ).join('');
+            return `
+                <div class="${openByDefault ? 'open' : ''}" id="review-edit-inner">
+                    <div style="font-weight:700;font-size:0.85rem;margin-bottom:0.65rem;color:#0f172a;">Edit expense details</div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.65rem;margin-bottom:0.65rem;">
+                        <div>
+                            <label style="font-weight:600;display:block;margin-bottom:0.25rem;font-size:0.72rem;">Category</label>
+                            <select id="review-category" style="width:100%;padding:0.45rem;border-radius:8px;border:1px solid #e2e8f0;font-size:0.75rem;">${catSelectHtml}</select>
+                        </div>
+                        <div>
+                            <label style="font-weight:600;display:block;margin-bottom:0.25rem;font-size:0.72rem;">Payment (₹)</label>
+                            <input type="number" id="review-payment" step="0.01" value="${paymentVal}" style="width:100%;padding:0.45rem;border-radius:8px;border:1px solid #e2e8f0;font-size:0.75rem;" />
+                        </div>
+                    </div>
+                    <details style="margin-bottom:0.65rem;">
+                        <summary style="cursor:pointer;font-size:0.75rem;font-weight:600;color:#475569;">Advanced: JSON data</summary>
+                        <textarea id="json-editor" style="width:100%;height:120px;margin-top:0.5rem;font-family:Monaco,Menlo,monospace;font-size:0.68rem;padding:0.5rem;border:1px solid #e2e8f0;border-radius:8px;">${JSON.stringify(pending.extracted_data, null, 2)}</textarea>
+                    </details>
+                    <button type="button" class="wa-cta primary-green" style="width:100%" onclick="savePending()">Save &amp; Approve</button>
+                </div>`;
+        }
 
         // ============== PENDING REVIEW FUNCTIONS ==============
         let currentPendingToken = null;
@@ -1646,28 +2190,30 @@ def dashboard(request: Request):
                     return;
                 }
 
-                listDiv.innerHTML = pendings.map(p => {
+                listDiv.innerHTML = '<div class="pending-receipt-list">' + pendings.map(p => {
                     const ext = p.extracted_data || {};
                     const amt = ext.amounts && ext.amounts.total != null ? formatINR(Number(ext.amounts.total)) : '—';
                     const cat = p.expense_category || ext.expense_category || 'Other';
+                    const conf = confidenceUi(p.confidence_overall || 0);
+                    const vendor = (ext.vendor_or_sender && ext.vendor_or_sender.name) || ext.vendor_name || p.file_name || 'Receipt';
+                    const imgUrl = pendingImageUrl(p.token);
                     return `
-                    <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; cursor: pointer; transition: all 0.2s;" onclick="openReviewModal('${p.token}')">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>
-                                <div style="font-weight: 600; margin-bottom: 0.25rem;">${p.file_name || 'Untitled'}</div>
-                                <div style="font-size: 0.875rem; color: #666;">
-                                    <span class="badge badge-category">${cat}</span>
-                                    <span class="badge badge-payment" style="margin-left:0.35rem;">${amt}</span>
-                                </div>
-                                <div style="font-size: 0.75rem; color: #999; margin-top:0.25rem;">${new Date(p.created_at).toLocaleString()}</div>
+                    <div class="pending-receipt-item" onclick="openReviewModal('${p.token}')">
+                        <div class="pending-receipt-thumb ${conf.tier}">
+                            <img src="${imgUrl}" alt="" onerror="this.parentElement.classList.add('no-image')" />
+                            <span class="pending-thumb-fallback">🧾</span>
+                            <span class="pending-tier-pill ${conf.tier}">${conf.pct}%</span>
+                        </div>
+                        <div class="pending-receipt-info">
+                            <div class="pending-receipt-title">${vendor}</div>
+                            <div class="pending-receipt-meta">
+                                <span class="badge badge-category">${cat}</span>
+                                <span class="badge badge-payment" style="margin-left:0.35rem;">${amt}</span>
                             </div>
-                            <div style="text-align: right;">
-                                <div style="font-size: 0.875rem; color: #666;">Confidence: ${((p.confidence_overall || 0) * 100).toFixed(0)}%</div>
-                                <div style="font-size: 0.75rem; color: #999;">${p.source}</div>
-                            </div>
+                            <div class="pending-receipt-meta">${new Date(p.created_at).toLocaleString()} · ${p.source || 'web'}</div>
                         </div>
                     </div>`;
-                }).join('');
+                }).join('') + '</div>';
             } catch (e) {
                 document.getElementById('pending-list').innerHTML = `<div class="error">Error: ${e.message}</div>`;
             }
@@ -1682,34 +2228,22 @@ def dashboard(request: Request):
 
                 currentPendingData = pending.extracted_data;
                 const ext = pending.extracted_data || {};
-                const paymentVal = (ext.amounts && ext.amounts.total != null) ? ext.amounts.total : '';
+                const paymentVal = (ext.amounts && ext.amounts.total != null)
+                    ? ext.amounts.total
+                    : (ext.total_amount != null ? ext.total_amount : (ext.total || ''));
                 const currentCat = pending.expense_category || ext.expense_category || 'Other';
-                const catSelectHtml = expenseCategories.map(c =>
-                    `<option value="${c}" ${c === currentCat ? 'selected' : ''}>${c}</option>`
-                ).join('');
+                const conf = confidenceUi(pending.confidence_overall || 0);
+                const imageUrl = pendingImageUrl(token);
 
-                const contentDiv = document.getElementById('review-content');
-                contentDiv.innerHTML = `
-                    <div style="margin-bottom: 1rem;">
-                        <strong>File:</strong> ${pending.file_name || 'Untitled'}<br>
-                        <strong>Type:</strong> ${pending.mime_type || 'Unknown'}<br>
-                        <strong>Confidence:</strong> ${((pending.confidence_overall || 0) * 100).toFixed(0)}%
-                    </div>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem;">
-                        <div>
-                            <label style="font-weight:600;display:block;margin-bottom:0.35rem;">Category</label>
-                            <select id="review-category" style="width:100%;padding:0.5rem;border-radius:8px;border:1px solid #e0e0e0;">${catSelectHtml}</select>
-                        </div>
-                        <div>
-                            <label style="font-weight:600;display:block;margin-bottom:0.35rem;">Payment (₹)</label>
-                            <input type="number" id="review-payment" step="0.01" value="${paymentVal}" style="width:100%;padding:0.5rem;border-radius:8px;border:1px solid #e0e0e0;" />
-                        </div>
-                    </div>
-                    <div style="margin-top: 1rem;">
-                        <label style="font-weight: 600; display: block; margin-bottom: 0.5rem;">Extracted Data (JSON):</label>
-                        <textarea id="json-editor" style="width: 100%; height: 300px; font-family: 'Monaco', 'Menlo', monospace; font-size: 0.875rem; padding: 1rem; border: 1px solid #e0e0e0; border-radius: 8px;">${JSON.stringify(pending.extracted_data, null, 2)}</textarea>
-                    </div>
-                `;
+                document.getElementById('review-content').innerHTML = buildConfidenceImageCard(
+                    pending, conf, imageUrl
+                );
+
+                const editDrawer = document.getElementById('review-edit-drawer');
+                editDrawer.className = conf.tier === 'red' ? 'open' : '';
+                editDrawer.innerHTML = buildReviewEditDrawerHtml(
+                    pending, ext, currentCat, paymentVal, conf.tier === 'red'
+                );
 
                 document.getElementById('review-modal').style.display = 'flex';
             } catch (e) {
@@ -1719,6 +2253,8 @@ def dashboard(request: Request):
 
         function closeReviewModal() {
             document.getElementById('review-modal').style.display = 'none';
+            const drawer = document.getElementById('review-edit-drawer');
+            if (drawer) { drawer.innerHTML = ''; drawer.className = ''; }
             currentPendingToken = null;
             currentPendingData = null;
         }
@@ -1730,7 +2266,10 @@ def dashboard(request: Request):
             const categoryEl = document.getElementById('review-category');
             const paymentEl = document.getElementById('review-payment');
             try {
-                const updatedData = JSON.parse(jsonEditor.value);
+                let updatedData = currentPendingData ? JSON.parse(JSON.stringify(currentPendingData)) : {};
+                if (jsonEditor && jsonEditor.value) {
+                    updatedData = JSON.parse(jsonEditor.value);
+                }
                 if (categoryEl) {
                     updatedData.expense_category = categoryEl.value;
                 }

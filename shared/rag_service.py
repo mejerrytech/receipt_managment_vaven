@@ -10,6 +10,7 @@ This service provides:
 import os
 import json
 import logging
+import uuid
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 
@@ -104,7 +105,7 @@ class RAGService:
     def answer_question(
         self,
         user_query: str,
-        user_id: int,
+        user_id: uuid.UUID,
         n_results: int = 5,
     ) -> Dict[str, Any]:
         """
@@ -145,7 +146,7 @@ class RAGService:
     def _retrieve_documents(
         self,
         query: str,
-        user_id: int,
+        user_id: uuid.UUID,
         n_results: int = 5
     ) -> List[Dict[str, Any]]:
         """Retrieve documents via semantic search."""
@@ -164,7 +165,7 @@ class RAGService:
     def _enrich_documents(
         self,
         docs: List[Dict],
-        user_id: int,
+        user_id: uuid.UUID,
     ) -> List[Dict[str, Any]]:
         """Enrich vector search results with full DB details from PostgreSQL."""
         try:
@@ -347,7 +348,7 @@ Use the answer_question function to provide your response."""
     def search_and_summarize(
         self,
         topic: str,
-        user_id: int,
+        user_id: uuid.UUID,
     ) -> Dict[str, Any]:
         """
         Search for documents about a topic and provide a summary.

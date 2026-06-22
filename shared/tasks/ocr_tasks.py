@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import uuid
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
@@ -41,7 +42,7 @@ def _run(coro):
         return future.result()
 
 
-async def _send_telegram_message_async(chat_id: int, text: str, pending_id: int) -> Optional[int]:
+async def _send_telegram_message_async(chat_id: int, text: str, pending_id: uuid.UUID) -> Optional[int]:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token or not chat_id:
         return None
@@ -60,7 +61,7 @@ async def _send_telegram_message_async(chat_id: int, text: str, pending_id: int)
     return msg.message_id
 
 
-def _send_telegram_message(chat_id: int, text: str, pending_id: int) -> Optional[int]:
+def _send_telegram_message(chat_id: int, text: str, pending_id: uuid.UUID) -> Optional[int]:
     try:
         return _run(_send_telegram_message_async(chat_id=chat_id, text=text, pending_id=pending_id))
     except Exception:
@@ -68,7 +69,7 @@ def _send_telegram_message(chat_id: int, text: str, pending_id: int) -> Optional
         return None
 
 
-def _send_telegram_ready(chat_id: int, pending_id: int, extracted_json: str, confidence: float) -> Optional[int]:
+def _send_telegram_ready(chat_id: int, pending_id: uuid.UUID, extracted_json: str, confidence: float) -> Optional[int]:
     async def _build_and_send():
         card_text = await build_upload_preview_card(extracted_json=extracted_json, confidence=confidence)
         return await _send_telegram_message_async(chat_id=chat_id, text=card_text, pending_id=pending_id)
@@ -123,7 +124,7 @@ def _send_telegram_info(chat_id: int, text: str) -> None:
     time_limit=OCR_TASK_TIME_LIMIT,
     name="shared.tasks.ocr_tasks.process_pending_ocr",
 )
-def process_pending_ocr(self, pending_id: int, user_id: int):
+def process_pending_ocr(self, pending_id: uuid.UUID, user_id: uuid.UUID):
     """
     Process one pending OCR job:
     - Download source file from Telegram

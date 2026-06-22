@@ -10,6 +10,7 @@ This version uses the orchestrator to:
 import json
 import logging
 import re
+import uuid
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 
@@ -19,13 +20,13 @@ from sqlalchemy import text
 from shared.orchestrator import get_orchestrator, AgentType, ModelProvider, AgentStep
 from shared.vector_service import get_vector_service
 from shared.database import DatabaseService, engine
+from shared.id_types import as_uuid, as_str, sql_uuid
 
 load_dotenv()
 
 logger = logging.getLogger("nlp_sql_v2")
 
 _nlp_v2_prompt_cache: Dict[str, tuple[str, str]] = {}
-
 
 def invalidate_telegram_q_prompt_cache() -> None:
     """Clear cached /q prompts (call after admin updates DB)."""
@@ -114,7 +115,7 @@ def _rows_for_llm(filtered_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             row["extracted_data_raw"] = ext[:20000]
         rows.append(row)
     return rows
-\
+
 
 def _documents_to_formatter_rows(documents: List[Any]) -> List[Dict[str, Any]]:
     """Convert Document ORM rows into formatter-ready rows with full OCR JSON."""
@@ -134,29 +135,6 @@ def _documents_to_formatter_rows(documents: List[Any]) -> List[Dict[str, Any]]:
             row["extracted_data"] = parsed
         rows.append(row)
     return rows
-
-
-def _vector_item_from_document(doc: Any, score: float, token_match: bool = False) -> Dict[str, Any]:
-    """Build a hybrid retrieval row from a PostgreSQL Document."""
-    created = doc.created_at.isoformat() if getattr(doc, "created_at", None) else None
-    raw_json = getattr(doc, "extracted_data", None)
-    parsed = _parse_extracted_json_column(raw_json)
-    vendor = getattr(doc, "vendor_name", None) or (
-        DatabaseService._vendor_name_from_ocr_data(parsed) if parsed else None
-    )
-    return {
-        "entry_kind": "document",
-        "type": getattr(doc, "document_type", None) or "document",
-        "id": doc.id,
-        "title": getattr(doc, "title", None) or getattr(doc, "file_name", None) or f"Document {doc.id}",
-        "amount": getattr(doc, "total_amount", None),
-        "vendor": vendor,
-        "date": created or getattr(doc, "document_date", None),
-        "extracted_data": raw_json,
-        "_text": "",
-        "_score": score,
-        "_token_match": token_match,
-    }
 
 
 # Function schema for generate_sql function calling
@@ -460,12 +438,15 @@ class NLPSQLServiceV2:
         self.orchestrator = get_orchestrator()
         # Vector service for fallback
         self.vector_service = get_vector_service()
-        self.expense_categories = DatabaseService.EXPENSE_CATEGORIES
         # Conversation history: {user_id: [{"query": str, "response": str}, ...]}
         self.conversation_history: Dict[int, List[Dict[str, str]]] = {}
         self.MAX_HISTORY = 10
 
         logger.info("NLPSQLServiceV2 initialized with orchestration layer")
+
+    @property
+    def expense_categories(self) -> List[str]:
+        return DatabaseService.get_expense_categories_for_ai()
 
     @staticmethod
     def _render_q_user_template(template: Optional[str], **kwargs: Any) -> str:
@@ -502,7 +483,7 @@ class NLPSQLServiceV2:
         _nlp_v2_prompt_cache[key] = tup
         return tup
 
-    def _get_conversation_context(self, user_id: int) -> str:
+    def _get_conversation_context(self, user_id: uuid.UUID) -> str:
         """Get formatted conversation history for the user."""
         if user_id not in self.conversation_history:
             return ""
@@ -545,7 +526,7 @@ class NLPSQLServiceV2:
         context = "\n".join(context_lines)
         return f"\n\n=== PREVIOUS CONVERSATION HISTORY (CRITICAL FOR PRONOUN RESOLUTION) ===\n{context}\n=== END OF HISTORY ===\n"
 
-    def _add_to_history(self, user_id: int, query: str, response: str):
+    def _add_to_history(self, user_id: uuid.UUID, query: str, response: str):
         """Add interaction to conversation history, keeping only last 10."""
         history = self.conversation_history.get(user_id)
         if isinstance(history, dict):
@@ -573,13 +554,13 @@ class NLPSQLServiceV2:
         if len(history) > self.MAX_HISTORY:
             self.conversation_history[user_id] = history[-self.MAX_HISTORY:]
 
-    def clear_user_history(self, user_id: int) -> None:
+    def clear_user_history(self, user_id: uuid.UUID) -> None:
         """Clear conversation history for a specific user."""
         if user_id in self.conversation_history:
             del self.conversation_history[user_id]
             logger.info(f"Cleared NLP SQL conversation history for user {user_id}")
 
-    def _resolve_query_with_context(self, user_query: str, user_id: int) -> Dict[str, Any]:
+    def _resolve_query_with_context(self, user_query: str, user_id: uuid.UUID) -> Dict[str, Any]:
         """Resolve follow-ups through the model instead of local keyword rules."""
         text_query = (user_query or "").strip()
         empty = {
@@ -672,20 +653,21 @@ Resolve now."""
 
         return empty
 
-    def _build_global_summary_sql(self, user_id: int) -> str:
+    def _build_global_summary_sql(self, user_id: uuid.UUID) -> str:
         """Return canonical aggregate SQL for global expense summary requests."""
+        uid = sql_uuid(user_id)
         return f"""SELECT
-  (SELECT COUNT(*) FROM documents WHERE user_id = {user_id}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL) as total_documents,
-  COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL), 0) as total_amount,
-  (SELECT COUNT(DISTINCT vendor_name) FROM documents WHERE user_id = {user_id} AND vendor_name IS NOT NULL) as unique_vendors,
+  (SELECT COUNT(*) FROM documents WHERE user_id = {uid}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {uid} AND amount IS NOT NULL) as total_documents,
+  COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {uid}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {uid} AND amount IS NOT NULL), 0) as total_amount,
+  (SELECT COUNT(DISTINCT vendor_name) FROM documents WHERE user_id = {uid} AND vendor_name IS NOT NULL) as unique_vendors,
   (
-    COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {user_id}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL), 0)
+    COALESCE((SELECT SUM(total_amount) FROM documents WHERE user_id = {uid}), 0) + COALESCE((SELECT SUM(amount) FROM user_text_entries WHERE user_id = {uid} AND amount IS NOT NULL), 0)
   ) / NULLIF(
-    (SELECT COUNT(*) FROM documents WHERE user_id = {user_id}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {user_id} AND amount IS NOT NULL),
+    (SELECT COUNT(*) FROM documents WHERE user_id = {uid}) + (SELECT COUNT(*) FROM user_text_entries WHERE user_id = {uid} AND amount IS NOT NULL),
     0
   ) as avg_amount"""
 
-    def _should_use_global_summary_sql(self, user_query: str, user_id: int) -> bool:
+    def _should_use_global_summary_sql(self, user_query: str, user_id: uuid.UUID) -> bool:
         """
         Dynamically decide summary routing via prompt+function-calling.
         If the model is unavailable, keep the normal hybrid path.
@@ -725,7 +707,7 @@ Runtime rule:
 
         return False
 
-    def _is_identity_profile_query(self, user_query: str, user_id: int) -> bool:
+    def _is_identity_profile_query(self, user_query: str, user_id: uuid.UUID) -> bool:
         """Decide identity/name asks via DB prompt."""
         q = (user_query or "").strip()
         if not q:
@@ -762,7 +744,7 @@ Runtime rule:
 
         return False
 
-    def _understand_intent(self, user_query: str, user_id: int) -> Dict[str, Any]:
+    def _understand_intent(self, user_query: str, user_id: uuid.UUID) -> Dict[str, Any]:
         """
         Step 1: Understand user intent using GPT-4o with function calling.
         """
@@ -1159,7 +1141,7 @@ Classify now."""
         """Backward-compatible: true if plain text should be persisted as an expense entry."""
         return bool(self.classify_plain_text_expense(user_text).get("should_store"))
 
-    def _guardrail_username(self, user_id: int) -> str:
+    def _guardrail_username(self, user_id: uuid.UUID) -> str:
         """Return the stored username for the current DB user, or a stable internal fallback."""
         try:
             user = DatabaseService.get_user_by_id(user_id)
@@ -1169,24 +1151,35 @@ Classify now."""
             logger.exception("Could not load username guardrail for user_id=%s", user_id)
             return f"user_id:{user_id}"
 
-    def _sql_has_current_user_guardrail(self, sql: str, user_id: int, username: Optional[str] = None) -> bool:
+    def _sql_has_current_user_guardrail(self, sql: str, user_id: uuid.UUID, username: Optional[str] = None) -> bool:
         """Accept only SELECT SQL scoped to the current owner identity."""
         if not sql:
             return False
 
         sql_norm = " ".join(sql.split())
-        sql_compact = sql_norm.replace(" ", "").lower()
         if not sql_norm.upper().startswith("SELECT"):
             return False
 
         uid = str(user_id)
-        has_user_id_scope = (
-            f"user_id={uid}" in sql_compact
-            or f"users.id={uid}" in sql_compact
-            or f".user_id={uid}" in sql_compact
+        uid_escaped = re.escape(uid)
+        has_user_id_scope = bool(
+            re.search(
+                rf"(?:\b\w+\.)?user_id\s*=\s*['\"]?{uid_escaped}(?:['\"]|::uuid\b)",
+                sql_norm,
+                flags=re.IGNORECASE,
+            )
+            or re.search(
+                rf"(?:\b\w+\.)?users\.id\s*=\s*['\"]?{uid_escaped}(?:['\"]|::uuid\b)",
+                sql_norm,
+                flags=re.IGNORECASE,
+            )
             or (
                 " from users " in f" {sql_norm.lower()} "
-                and f"id={uid}" in sql_compact
+                and re.search(
+                    rf"\bid\s*=\s*['\"]?{uid_escaped}(?:['\"]|::uuid\b)",
+                    sql_norm,
+                    flags=re.IGNORECASE,
+                )
             )
         )
 
@@ -1203,7 +1196,7 @@ Classify now."""
 
         return has_user_id_scope or has_username_scope
 
-    def generate_sql(self, user_query: str, user_id: int) -> Dict[str, Any]:
+    def generate_sql(self, user_query: str, user_id: uuid.UUID) -> Dict[str, Any]:
         """
         Step 2: Generate SQL using GPT-4o with function calling.
         Falls back to Anthropic if GPT-4o fails.
@@ -1217,7 +1210,7 @@ Classify now."""
         username_guardrail = (
             f"users.username = {_sql_literal(username)}"
             if username and not username.startswith("user_id:")
-            else f"users.id = {user_id}"
+            else f"users.id = {sql_uuid(user_id)}"
         )
         system_prompt += f"""
 
@@ -1238,8 +1231,8 @@ Runtime grounding rules:
 - If exact structured SQL is uncertain, return rows with raw_data instead of collapsing to total_amount only.
 - documents.extracted_data is stored as TEXT JSON. Always cast before JSON operators, e.g. extracted_data::jsonb->>'vendor_address'. Prefer denormalized columns vendor_name, title, raw_text when possible.
 - documents.vendor_name may be NULL for some OCR uploads. For vendor/address/shop questions, also filter on documents.extracted_data ILIKE and return extracted_data as raw_data when structured columns are empty.
-- Current authenticated owner guardrail is {username_guardrail}; internal owner key is user_id = {user_id}.
-- Keep every query SELECT-only and scoped to this exact current owner. Prefer joining users and filtering {username_guardrail}; user_id = {user_id} is also accepted as the internal owner key.
+- Current authenticated owner guardrail is {username_guardrail}; internal owner key is user_id = {sql_uuid(user_id)}.
+- Keep every query SELECT-only and scoped to this exact current owner. Prefer joining users and filtering {username_guardrail}; user_id = {sql_uuid(user_id)} is also accepted as the internal owner key.
 - Never answer with rows for any other username/user_id, even if the user asks for someone else's data."""
         context = self._get_conversation_context(user_id)
         user_message = self._render_q_user_template(
@@ -1426,7 +1419,7 @@ Runtime grounding rules:
             return f"@{username}"
         return None
 
-    def _classify_should_search_saved_data(self, user_query: str, user_id: int) -> bool:
+    def _classify_should_search_saved_data(self, user_query: str, user_id: uuid.UUID) -> bool:
         """LLM routing: conversation-like message may still need saved document search."""
         context = self._get_conversation_context(user_id)
         sys_t, usr_t = self._q_tpl_pair("q_telegram_document_search_route")
@@ -1476,7 +1469,7 @@ Runtime grounding rules:
         suggested_action: str,
         confidence: float,
         user_query: str,
-        user_id: int,
+        user_id: uuid.UUID,
     ) -> tuple[bool, bool]:
         """Return (should_search, routed_via_document_classifier)."""
         if intent in ("sql_query", "semantic_search", "user_info"):
@@ -1496,7 +1489,7 @@ Runtime grounding rules:
             return via_classifier, via_classifier
         return False, False
 
-    def _social_response_result(self, user_query: str, user_id: int, mode: str = "conversation") -> Dict[str, Any]:
+    def _social_response_result(self, user_query: str, user_id: uuid.UUID, mode: str = "conversation") -> Dict[str, Any]:
         response = self._generate_social_response(user_query, mode=mode)
         self._add_to_history(user_id, user_query, response)
         return {
@@ -1511,7 +1504,7 @@ Runtime grounding rules:
             "fallback": True,
         }
 
-    def _build_identity_profile_response(self, user_query: str, user_id: int) -> str:
+    def _build_identity_profile_response(self, user_query: str, user_id: uuid.UUID) -> str:
         user = DatabaseService.get_user_by_id(user_id)
         if not user:
             return "User profile nahi mila."
@@ -1535,7 +1528,7 @@ Runtime grounding rules:
             "Your name isn't saved yet. Set your name on Telegram and try again."
         )
 
-    def ask_ai(self, user_query: str, user_id: int) -> Dict[str, Any]:
+    def ask_ai(self, user_query: str, user_id: uuid.UUID) -> Dict[str, Any]:
         """
         Complete pipeline with orchestration:
         1. Understand Intent (GPT-4o)
@@ -1580,7 +1573,7 @@ Runtime grounding rules:
             return False
         return bool(re.search(r"kitn|how many|count|total|unique|mere paas|kya", q))
 
-    def _answer_unique_vendor_count(self, user_query: str, user_id: int) -> Dict[str, Any]:
+    def _answer_unique_vendor_count(self, user_query: str, user_id: uuid.UUID) -> Dict[str, Any]:
         vendors = DatabaseService.get_distinct_vendor_names(user_id)
         count = len(vendors)
         total_docs = len(DatabaseService.get_user_documents(user_id, limit=5000))
@@ -1609,7 +1602,7 @@ Runtime grounding rules:
     def _hybrid_sql_and_vector_query(
         self,
         user_query: str,
-        user_id: int,
+        user_id: uuid.UUID,
         route_reason: str = "",
         force_data_question: bool = False,
     ) -> Dict[str, Any]:
@@ -1690,7 +1683,7 @@ Runtime grounding rules:
         user_query: str,
         sql: str,
         data: List[Dict],
-        user_id: int,
+        user_id: uuid.UUID,
         vector_supplement: Optional[List[Dict[str, Any]]] = None,
         resolved_query: Optional[str] = None,
         focus: str = "",
@@ -1785,7 +1778,7 @@ Runtime grounding rules:
             lines.append(f"...and {len(data) - len(formatter_rows)} more rows")
         return "\n".join(lines)
 
-    def _store_sql_results(self, user_query: str, sql: str, data: List[Dict], user_id: int) -> None:
+    def _store_sql_results(self, user_query: str, sql: str, data: List[Dict], user_id: uuid.UUID) -> None:
         """Store SQL results in vector database for future semantic search."""
         if not data:
             return
@@ -1811,11 +1804,11 @@ Runtime grounding rules:
             # Use the shared OpenAI embedding path so dimensions/model stay consistent.
             embedding = self.vector_service._generate_embedding(searchable_text)
 
-            self.vector_service.collection.upsert(
+            self.vector_service.sql_cache_collection.upsert(
                 ids=[result_id],
                 embeddings=[embedding],
                 metadatas=[{
-                    "user_id": user_id,
+                    "user_id": as_str(user_id),
                     "type": "sql_result",
                     "original_query": user_query,
                     "sql": sql[:500],
@@ -1832,18 +1825,10 @@ Runtime grounding rules:
             raise
 
     def _retrieve_vector_hits(
-        self, user_query: str, user_id: int, n_results: int = 10
+        self, user_query: str, user_id: uuid.UUID, n_results: int = 10
     ) -> List[Dict[str, Any]]:
-        """Chroma semantic search + SQL token match, enriched from PostgreSQL (user_id scoped)."""
+        """Chroma semantic search enriched from PostgreSQL (user_id scoped)."""
         username = self._guardrail_username(user_id)
-        token_docs = DatabaseService.find_documents_matching_query_tokens(
-            user_id, user_query, limit=5
-        )
-        token_items = [
-            _vector_item_from_document(doc, score=92.0, token_match=True)
-            for doc in token_docs
-        ]
-        seen_doc_ids = {item["id"] for item in token_items if item.get("id") is not None}
 
         results = self.vector_service.search(
             query=user_query,
@@ -1853,7 +1838,7 @@ Runtime grounding rules:
         )
         results = [
             r for r in results
-            if int(r.get("user_id", user_id)) == int(user_id)
+            if str(r.get("user_id", user_id)) == str(user_id)
             and (
                 not r.get("username")
                 or username.startswith("user_id:")
@@ -1861,28 +1846,19 @@ Runtime grounding rules:
             )
         ]
         logger.info(
-            "Vector guardrail retained %s hits (%s token-matched docs) for username=%s user_id=%s",
+            "Vector search retained %s hits for username=%s user_id=%s",
             len(results),
-            len(token_items),
             username,
             user_id,
         )
 
-        if not results and not token_items:
+        if not results:
             return []
 
-        data: List[Dict[str, Any]] = list(token_items)
+        data: List[Dict[str, Any]] = []
         vector_rows: List[Dict[str, Any]] = []
         vector_source_rows: List[Dict[str, Any]] = []
         for r in results:
-            if r.get("entry_type") != "user_text_entry":
-                did = r.get("doc_id")
-                try:
-                    doc_key = int(did) if did is not None else None
-                except (TypeError, ValueError):
-                    doc_key = None
-                if doc_key is not None and doc_key in seen_doc_ids:
-                    continue
             if r.get("entry_type") == "user_text_entry":
                 title = f"Text Entry #{r.get('text_entry_id')} (Score: {r['similarity_score']}%)"
                 item_type = "user_text_entry"
@@ -1903,44 +1879,30 @@ Runtime grounding rules:
         data.extend(vector_rows)
 
         try:
-            doc_ids: List[int] = list(seen_doc_ids)
+            doc_ids: List[uuid.UUID] = []
             for r in results:
                 if r.get("entry_type") == "user_text_entry":
                     continue
-                did = r.get("doc_id")
-                if did is None:
-                    continue
-                try:
-                    doc_ids.append(int(did))
-                except (TypeError, ValueError):
-                    continue
+                doc_key = as_uuid(r.get("doc_id"))
+                if doc_key is not None and doc_key not in doc_ids:
+                    doc_ids.append(doc_key)
             doc_details = DatabaseService.fetch_documents_for_vector_enrichment(user_id, doc_ids)
 
-            text_entry_ids: List[int] = []
+            text_entry_ids: List[uuid.UUID] = []
             for r in results:
                 if r.get("entry_type") != "user_text_entry":
                     continue
-                tid = r.get("text_entry_id")
-                if tid is None:
-                    continue
-                try:
-                    text_entry_ids.append(int(tid))
-                except (TypeError, ValueError):
-                    continue
+                entry_key = as_uuid(r.get("text_entry_id"))
+                if entry_key is not None and entry_key not in text_entry_ids:
+                    text_entry_ids.append(entry_key)
             text_entry_details = DatabaseService.fetch_user_text_entries_for_vector_enrichment(
                 user_id, text_entry_ids
             )
 
-            vector_offset = len(token_items)
             for i, item in enumerate(vector_rows):
-                data_index = vector_offset + i
                 result_row = vector_source_rows[i]
                 if result_row.get("entry_type") == "user_text_entry":
-                    teid = result_row.get("text_entry_id")
-                    try:
-                        teid = int(teid) if teid is not None else None
-                    except (TypeError, ValueError):
-                        teid = None
+                    teid = as_uuid(result_row.get("text_entry_id"))
                     if teid in text_entry_details:
                         t = text_entry_details[teid]
                         item["entry_kind"] = "user_text_entry"
@@ -1951,14 +1913,10 @@ Runtime grounding rules:
                         item["expense_category"] = t.get("expense_category")
                         item["date"] = t.get("created_at")
                         item["user_text_body"] = t.get("text")
-                    data[data_index] = item
+                    data[i] = item
                     continue
 
-                doc_id = result_row.get("doc_id")
-                try:
-                    doc_key = int(doc_id) if doc_id is not None else None
-                except (TypeError, ValueError):
-                    doc_key = None
+                doc_key = as_uuid(result_row.get("doc_id"))
                 if doc_key is not None and doc_key in doc_details:
                     d = doc_details[doc_key]
                     item["entry_kind"] = "document"
@@ -1969,29 +1927,22 @@ Runtime grounding rules:
                     item["vendor"] = d.get("vendor_name")
                     item["date"] = d.get("created_at") or d.get("document_date")
                     item["extracted_data"] = d.get("extracted_data")
-                    data[data_index] = item
+                    data[i] = item
         except Exception as e:
             logger.warning("Could not enrich vector results: %s", e)
 
         min_score = 50.0
-        filtered = [
-            d for d in data
-            if d.get("_token_match") or d.get("_score", 0) >= min_score
-        ]
+        filtered = [d for d in data if d.get("_score", 0) >= min_score]
         if not filtered and data:
             filtered = sorted(data, key=lambda x: x.get("_score", 0), reverse=True)[:1]
         else:
-            filtered = sorted(
-                filtered,
-                key=lambda x: (bool(x.get("_token_match")), x.get("_score", 0)),
-                reverse=True,
-            )[:5]
+            filtered = sorted(filtered, key=lambda x: x.get("_score", 0), reverse=True)[:5]
         return filtered
 
     def _answer_from_vector_hits(
         self,
         user_query: str,
-        user_id: int,
+        user_id: uuid.UUID,
         vector_items: List[Dict[str, Any]],
         sql_error: Optional[str] = None,
         resolved_query: Optional[str] = None,
@@ -2051,7 +2002,7 @@ Runtime grounding rules:
             "hybrid": True,
         }
 
-    def _vector_search_fallback(self, user_query: str, user_id: int, error_reason: str = None) -> Dict[str, Any]:
+    def _vector_search_fallback(self, user_query: str, user_id: uuid.UUID, error_reason: str = None) -> Dict[str, Any]:
         """Semantic search fallback when SQL fails."""
         import hashlib
         import time

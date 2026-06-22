@@ -42,6 +42,11 @@ For the JSON output:
 - Include any fields that are actually present in the document (vendor, date, amounts,
   line items, invoice/order numbers, tax IDs, addresses, recipient, etc.).
 - For financial documents capture totals, subtotals, taxes and individual line items.
+- Always include GST/tax fields when visible on the document:
+  * "identifiers": {{ "gstin": "<15-char GST number>", "invoice_number": "..." }}
+  * "amounts": {{ "total": <number>, "currency": "INR", "gst": <total tax if shown> }}
+  * "taxes": {{ "cgst": <number or null>, "sgst": <number or null>, "igst": <number or null> }}
+  Use CGST+SGST for intra-state bills and IGST for inter-state bills. Use null for missing components.
 - Set "expense_category" to the single best match from: {expense_categories}
 - Add a "confidence" object with an "overall" score (0.0-1.0) and per-field scores for
   the fields you extracted.
@@ -75,8 +80,11 @@ class GeminiOCRService:
                 "Add it to .env — see .env.example for instructions."
             )
         self._client = genai.Client(api_key=api_key)
-        self._expense_categories = DatabaseService.EXPENSE_CATEGORIES
         logger.info("GeminiOCRService initialized with model=%s", GEMINI_MODEL)
+
+    @property
+    def _expense_categories(self) -> list[str]:
+        return DatabaseService.get_expense_categories_for_ai()
 
     def _image_part(self, image_bytes: bytes, mime_type: str) -> genai_types.Part:
         return genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type)

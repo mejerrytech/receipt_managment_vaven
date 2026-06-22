@@ -10,13 +10,17 @@ This service provides:
 import os
 import json
 import logging
+import math
 import time
+import uuid
 from typing import List, Dict, Any, Optional
 import openai
 from dotenv import load_dotenv
 import chromadb
 from chromadb.config import Settings
 from functools import lru_cache
+
+from shared.id_types import as_str
 
 load_dotenv()
 
@@ -56,8 +60,175 @@ class VectorService:
             name="documents",
             metadata={"hnsw:space": "cosine"}
         )
+        # SQL query cache lives in a separate collection so ephemeral ids never corrupt document HNSW.
+        self.sql_cache_collection = self.chroma_client.get_or_create_collection(
+            name="sql_query_cache",
+            metadata={"hnsw:space": "cosine"},
+        )
+
+        self._purge_legacy_sql_result_rows()
 
         logger.info(f"VectorService initialized with OpenAI embeddings and ChromaDB at {CHROMA_DB_PATH}")
+
+    @staticmethod
+    def _cosine_similarity(a: List[float], b: List[float]) -> float:
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(y * y for y in b))
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    def _format_search_matches(
+        self,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+        documents: List[str],
+        distances: List[float],
+        user_id: uuid.UUID,
+        username: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        matches: List[Dict[str, Any]] = []
+        expected_username = (username or "").strip()
+        for i, doc_id in enumerate(ids):
+            metadata = metadatas[i] if i < len(metadatas) else {}
+            document = documents[i] if i < len(documents) else ""
+            distance = distances[i] if i < len(distances) else 1.0
+
+            metadata_user_id = metadata.get("user_id", as_str(user_id))
+            if str(metadata_user_id) != str(user_id):
+                continue
+
+            metadata_username = (metadata.get("username") or "").strip()
+            if expected_username and metadata_username and metadata_username != expected_username:
+                continue
+
+            similarity = max(0, min(100, (1 - distance) * 100))
+            entry_type = metadata.get("type", "document")
+
+            if isinstance(doc_id, str) and doc_id.startswith("sql_result_"):
+                continue
+
+            if entry_type == "user_text_entry" and isinstance(doc_id, str) and doc_id.startswith("text_entry_"):
+                text_entry_id = doc_id.split("text_entry_", 1)[1]
+                if not text_entry_id:
+                    continue
+                matches.append({
+                    "doc_id": None,
+                    "text_entry_id": text_entry_id,
+                    "entry_type": "user_text_entry",
+                    "user_id": metadata_user_id,
+                    "username": metadata_username or expected_username,
+                    "text": document[:500],
+                    "expense_category": metadata.get("expense_category"),
+                    "similarity_score": round(similarity, 2),
+                    "source": "vector_search",
+                })
+                continue
+
+            doc_id_value = metadata.get("doc_id") or doc_id
+            if not doc_id_value or str(doc_id_value).startswith("pending_"):
+                continue
+
+            matches.append({
+                "doc_id": str(doc_id_value),
+                "text_entry_id": None,
+                "entry_type": "document",
+                "user_id": metadata_user_id,
+                "username": metadata_username or expected_username,
+                "text": document[:500],
+                "expense_category": metadata.get("expense_category"),
+                "similarity_score": round(similarity, 2),
+                "source": "vector_search",
+            })
+        return matches
+
+    def _search_bruteforce(
+        self,
+        query_embedding: List[float],
+        user_id: uuid.UUID,
+        n_results: int,
+        username: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Fallback when Chroma HNSW query fails: scan user rows and rank by cosine similarity."""
+        uid = as_str(user_id)
+        try:
+            batch = self.collection.get(
+                where={"user_id": uid},
+                include=["metadatas", "documents", "embeddings"],
+            )
+        except Exception as e:
+            logger.error("Bruteforce vector fallback get() failed for user %s: %s", uid, e)
+            return []
+
+        ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        documents = batch.get("documents") or []
+        embeddings = batch.get("embeddings") or []
+        if not ids or not embeddings:
+            return []
+
+        scored: List[tuple[float, int]] = []
+        for idx, emb in enumerate(embeddings):
+            if not emb:
+                continue
+            vid = ids[idx]
+            if isinstance(vid, str) and vid.startswith("sql_result_"):
+                continue
+            scored.append((self._cosine_similarity(query_embedding, emb), idx))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = scored[: max(n_results, 1)]
+        if not top:
+            return []
+
+        out_ids: List[str] = []
+        out_meta: List[Dict[str, Any]] = []
+        out_docs: List[str] = []
+        out_dist: List[float] = []
+        for sim, idx in top:
+            out_ids.append(ids[idx])
+            out_meta.append(metadatas[idx] if idx < len(metadatas) else {})
+            out_docs.append(documents[idx] if idx < len(documents) else "")
+            out_dist.append(max(0.0, 1.0 - sim))
+
+        matches = self._format_search_matches(
+            out_ids, out_meta, out_docs, out_dist, user_id, username
+        )
+        logger.info(
+            "Bruteforce vector fallback for user %s: found %s matches",
+            uid,
+            len(matches),
+        )
+        return matches
+
+    def _repair_collection_index(self) -> None:
+        """Recreate collection when Chroma HNSW index is corrupted."""
+        collection_name = self.collection.name
+        logger.warning("Recreating Chroma collection %s due to index corruption", collection_name)
+        self.chroma_client.delete_collection(name=collection_name)
+        self.collection = self.chroma_client.create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+    def _purge_legacy_sql_result_rows(self) -> int:
+        """Remove sql_result_* rows accidentally stored in the documents collection."""
+        try:
+            batch = self.collection.get(include=[])
+            ids = [
+                row_id for row_id in (batch.get("ids") or [])
+                if isinstance(row_id, str) and row_id.startswith("sql_result_")
+            ]
+            if ids:
+                self.collection.delete(ids=ids)
+                logger.info("Purged %s legacy sql_result rows from documents collection", len(ids))
+            return len(ids)
+        except Exception as e:
+            logger.warning("Could not purge legacy sql_result rows: %s", e)
+            return 0
 
     def _generate_embedding(self, text: str, max_retries: int = 4) -> List[float]:
         """Generate embedding for text using OpenAI with caching and transient-error retries."""
@@ -175,7 +346,7 @@ class VectorService:
         text = " | ".join(parts) if parts else "Untitled Document"
         return text[:8000]
 
-    def add_document(self, doc_id: int, user_id: int, doc_data: Dict[str, Any]) -> bool:
+    def add_document(self, doc_id: uuid.UUID, user_id: uuid.UUID, doc_data: Dict[str, Any]) -> bool:
         """
         Add or update a document in the vector database.
 
@@ -195,8 +366,8 @@ class VectorService:
             embedding = self._generate_embedding(text)
 
             ec = doc_data.get("expense_category")
-            uid = int(user_id)
-            did = int(doc_id)
+            uid = as_str(user_id)
+            did = as_str(doc_id)
             meta_base = {
                 "user_id": uid,
                 "doc_id": did,
@@ -243,18 +414,19 @@ class VectorService:
             logger.error(f"Failed to add document {doc_id} to vector DB: {e}")
             return False
 
-    def add_pending_document(self, pending_id: int, user_id: int, doc_data: Dict[str, Any]) -> bool:
+    def add_pending_document(self, pending_id: uuid.UUID, user_id: uuid.UUID, doc_data: Dict[str, Any]) -> bool:
         """Embed OCR-extracted pending upload so Q&A works before CONFIRM."""
         try:
             payload = {**doc_data, "status": "pending"}
             text = self._document_to_text(payload)
             embedding = self._generate_embedding(text)
-            vector_id = f"pending_{int(pending_id)}"
-            uid = int(user_id)
+            vector_id = f"pending_{pending_id}"
+            uid = as_str(user_id)
+            pid = as_str(pending_id)
             meta_base = {
                 "user_id": uid,
-                "pending_id": int(pending_id),
-                "doc_id": -int(pending_id),
+                "pending_id": pid,
+                "doc_id": pid,
                 "type": "pending_document",
                 "text": text[:1000],
             }
@@ -277,10 +449,10 @@ class VectorService:
             logger.error("Failed to add pending document %s to vector DB: %s", pending_id, e)
             return False
 
-    def delete_pending_document(self, pending_id: int) -> bool:
+    def delete_pending_document(self, pending_id: uuid.UUID) -> bool:
         """Remove pending OCR embedding after confirm or discard."""
         try:
-            self.collection.delete(ids=[f"pending_{int(pending_id)}"])
+            self.collection.delete(ids=[f"pending_{pending_id}"])
             logger.info("Deleted pending document %s from vector DB", pending_id)
             return True
         except Exception as e:
@@ -289,8 +461,8 @@ class VectorService:
 
     def add_user_text_entry(
         self,
-        entry_id: int,
-        user_id: int,
+        entry_id: uuid.UUID,
+        user_id: uuid.UUID,
         text: str,
         intent_tag: str = "expense_text",
         expense_category: Optional[str] = None,
@@ -305,8 +477,8 @@ class VectorService:
             embedding = self._generate_embedding(normalized_text)
             vector_id = f"text_entry_{entry_id}"
             meta = {
-                "user_id": int(user_id),
-                "doc_id": -int(entry_id),
+                "user_id": as_str(user_id),
+                "doc_id": as_str(entry_id),
                 "type": "user_text_entry",
                 "intent_tag": intent_tag,
                 "text": normalized_text[:1000],
@@ -329,7 +501,7 @@ class VectorService:
             logger.error(f"Failed to add user text entry {entry_id} to vector DB: {e}")
             return False
 
-    def delete_document(self, doc_id: int) -> bool:
+    def delete_document(self, doc_id: uuid.UUID) -> bool:
         """Delete a document from the vector database."""
         try:
             self.collection.delete(ids=[str(doc_id)])
@@ -339,10 +511,24 @@ class VectorService:
             logger.error(f"Failed to delete document {doc_id}: {e}")
             return False
 
+    def purge_user_vectors(self, user_id: uuid.UUID) -> int:
+        """Remove all Chroma rows for one user (user_id metadata guardrail)."""
+        uid = as_str(user_id)
+        try:
+            existing = self.collection.get(where={"user_id": uid}, include=[])
+            ids = existing.get("ids") or []
+            if ids:
+                self.collection.delete(ids=ids)
+                logger.info("Purged %s vector rows for user_id=%s", len(ids), uid)
+            return len(ids)
+        except Exception as e:
+            logger.error("Failed to purge vectors for user %s: %s", uid, e)
+            return 0
+
     def search(
         self,
         query: str,
-        user_id: int,
+        user_id: uuid.UUID,
         n_results: int = 10,
         username: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
@@ -368,111 +554,59 @@ class VectorService:
                 results = self.collection.query(
                     query_embeddings=[query_embedding],
                     n_results=n_results,
-                    where={"user_id": int(user_id)},
+                    where={"user_id": as_str(user_id)},
                     include=["metadatas", "documents", "distances"]
                 )
             except Exception as e:
+                err = str(e).lower()
                 # If dimension mismatch, recreate collection and return empty results
-                if "dimension" in str(e).lower():
+                if "dimension" in err:
                     logger.warning(f"Embedding dimension mismatch in search, recreating collection: {e}")
-                    collection_name = self.collection.name
-                    self.chroma_client.delete_collection(name=collection_name)
-                    self.collection = self.chroma_client.create_collection(
-                        name=collection_name,
-                        metadata={"hnsw:space": "cosine"}
-                    )
+                    self._repair_collection_index()
                     logger.info("Collection recreated with new embedding dimensions")
                     return []
-                else:
-                    raise
+                if "finding id" in err or "executing plan" in err:
+                    logger.warning("Chroma index query failed (%s); trying bruteforce fallback", e)
+                    return self._search_bruteforce(
+                        query_embedding, user_id, n_results, username
+                    )
+                raise
 
             # Format results
-            matches = []
-            expected_username = (username or "").strip()
             if results['ids'] and results['ids'][0]:
-                for i, doc_id in enumerate(results['ids'][0]):
-                    metadata = results['metadatas'][0][i] if results['metadatas'] else {}
-                    document = results['documents'][0][i] if results['documents'] else ""
-                    distance = results['distances'][0][i] if results['distances'] else 1.0
-
-                    metadata_user_id = metadata.get("user_id", user_id)
-                    try:
-                        if int(metadata_user_id) != int(user_id):
-                            logger.warning(
-                                "Dropped vector hit with mismatched user_id metadata=%s expected=%s",
-                                metadata_user_id,
-                                user_id,
-                            )
-                            continue
-                    except (TypeError, ValueError):
-                        logger.warning("Dropped vector hit with invalid user_id metadata=%s", metadata_user_id)
-                        continue
-
-                    metadata_username = (metadata.get("username") or "").strip()
-                    if expected_username and metadata_username and metadata_username != expected_username:
-                        logger.warning(
-                            "Dropped vector hit with mismatched username metadata=%s expected=%s",
-                            metadata_username,
-                            expected_username,
-                        )
-                        continue
-
-                    # Calculate similarity score (0-100%)
-                    similarity = max(0, min(100, (1 - distance) * 100))
-
-                    entry_type = metadata.get("type", "document")
-
-                    # Skip query-history artifacts.
-                    if isinstance(doc_id, str) and doc_id.startswith("sql_result_"):
-                        continue
-
-                    if entry_type == "user_text_entry" and isinstance(doc_id, str) and doc_id.startswith("text_entry_"):
-                        try:
-                            text_entry_id = int(doc_id.split("text_entry_")[1])
-                        except Exception:
-                            continue
-                        matches.append({
-                            "doc_id": None,
-                            "text_entry_id": text_entry_id,
-                            "entry_type": "user_text_entry",
-                            "user_id": metadata_user_id,
-                            "username": metadata_username or expected_username,
-                            "text": document[:500],
-                            "expense_category": metadata.get("expense_category"),
-                            "similarity_score": round(similarity, 2),
-                            "source": "vector_search"
-                        })
-                        continue
-
-                    # Regular document IDs
-                    try:
-                        doc_id_int = int(doc_id)
-                    except (ValueError, TypeError):
-                        continue
-
-                    matches.append({
-                        "doc_id": doc_id_int,
-                        "text_entry_id": None,
-                        "entry_type": "document",
-                        "user_id": metadata_user_id,
-                        "username": metadata_username or expected_username,
-                        "text": document[:500],  # Truncate for display
-                        "expense_category": metadata.get("expense_category"),
-                        "similarity_score": round(similarity, 2),
-                        "source": "vector_search"
-                    })
+                matches = self._format_search_matches(
+                    results['ids'][0],
+                    results['metadatas'][0] if results['metadatas'] else [],
+                    results['documents'][0] if results['documents'] else [],
+                    results['distances'][0] if results['distances'] else [],
+                    user_id,
+                    username,
+                )
+            else:
+                matches = []
 
             logger.info(f"Vector search for user {user_id}: found {len(matches)} matches")
             return matches
 
         except Exception as e:
             logger.error(f"Vector search failed for user {user_id}: {e}")
-            return []
+            try:
+                query_embedding = self._generate_embedding(query)
+                return self._search_bruteforce(
+                    query_embedding, user_id, n_results, username
+                )
+            except Exception as fallback_err:
+                logger.error(
+                    "Vector search bruteforce fallback failed for user %s: %s",
+                    user_id,
+                    fallback_err,
+                )
+                return []
 
     def get_similar_documents(
         self,
-        doc_id: int,
-        user_id: int,
+        doc_id: uuid.UUID,
+        user_id: uuid.UUID,
         n_results: int = 5
     ) -> List[Dict[str, Any]]:
         """
@@ -500,31 +634,27 @@ class VectorService:
             similar = self.collection.query(
                 query_embeddings=result['embeddings'],
                 n_results=n_results + 1,  # +1 to exclude the document itself
-                where={"user_id": int(user_id)},
+                where={"user_id": as_str(user_id)},
                 include=["metadatas", "documents", "distances"]
             )
 
             matches = []
             if similar['ids'] and similar['ids'][0]:
                 for i, sid in enumerate(similar['ids'][0]):
-                    try:
-                        sid_int = int(sid)
-                    except (ValueError, TypeError):
-                        # Skip non-numeric IDs (SQL result entries)
+                    if str(sid) == str(doc_id):
                         continue
 
-                    if sid_int != doc_id:  # Exclude the reference document
-                        metadata = similar['metadatas'][0][i] if similar['metadatas'] else {}
-                        document = similar['documents'][0][i] if similar['documents'] else ""
-                        distance = similar['distances'][0][i] if similar['distances'] else 1.0
+                    metadata = similar['metadatas'][0][i] if similar['metadatas'] else {}
+                    document = similar['documents'][0][i] if similar['documents'] else ""
+                    distance = similar['distances'][0][i] if similar['distances'] else 1.0
 
-                        similarity = max(0, min(100, (1 - distance) * 100))
+                    similarity = max(0, min(100, (1 - distance) * 100))
 
-                        matches.append({
-                            "doc_id": sid_int,
-                            "text": document[:500],
-                            "similarity_score": round(similarity, 2)
-                        })
+                    matches.append({
+                        "doc_id": str(metadata.get("doc_id") or sid),
+                        "text": document[:500],
+                        "similarity_score": round(similarity, 2),
+                    })
 
             return matches[:n_results]
 

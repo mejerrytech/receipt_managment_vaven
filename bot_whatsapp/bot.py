@@ -726,7 +726,7 @@ def _get_confidence(extracted_json: str) -> float:
     return 0.0
 
 
-async def _confirm_pending(pending_id: int, db_user) -> str:
+async def _confirm_pending(pending_id: uuid.UUID, db_user) -> str:
     pending = db_service.get_pending_document_by_id(pending_id, db_user.id)
     if not pending:
         return "Pending document not found or already handled."
@@ -744,7 +744,7 @@ async def _confirm_pending(pending_id: int, db_user) -> str:
     return f"Document saved. ID: {doc.id}.{note}"
 
 
-async def _edit_pending(pending_id: int, corrected_json: str, db_user) -> str:
+async def _edit_pending(pending_id: uuid.UUID, corrected_json: str, db_user) -> str:
     pending = db_service.get_pending_document_by_id(pending_id, db_user.id)
     if not pending:
         return "Pending document not found or already handled."
@@ -826,15 +826,25 @@ async def whatsapp_webhook(request: Request) -> Response:
             except Exception:
                 logger.exception("WhatsApp async answer failed sid=%s prefix=%s", message_sid or "-", log_prefix)
 
-        confirm_match = re.match(r"^(?:confirm|save)\s+(\d+)\s*$", body, flags=re.IGNORECASE)
+        confirm_match = re.match(
+            r"^(?:confirm|save)\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\s*$",
+            body,
+            flags=re.IGNORECASE,
+        )
         if confirm_match:
-            return _cacheable_xml_response(message_sid, await _confirm_pending(int(confirm_match.group(1)), db_user))
+            return _cacheable_xml_response(
+                message_sid, await _confirm_pending(uuid.UUID(confirm_match.group(1)), db_user)
+            )
 
-        edit_match = re.match(r"^edit\s+(\d+)\s+(.+)$", body, flags=re.IGNORECASE | re.DOTALL)
+        edit_match = re.match(
+            r"^edit\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\s+(.+)$",
+            body,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         if edit_match:
             return _cacheable_xml_response(
                 message_sid,
-                await _edit_pending(int(edit_match.group(1)), edit_match.group(2).strip(), db_user)
+                await _edit_pending(uuid.UUID(edit_match.group(1)), edit_match.group(2).strip(), db_user)
             )
 
         lower = body.lower()

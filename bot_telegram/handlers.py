@@ -4,6 +4,7 @@ import logging
 import time
 import hashlib
 import os
+import uuid
 from typing import Any, Dict, List
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
@@ -107,7 +108,7 @@ def _compact_ocr_payload_for_summary(extracted_json: str) -> Dict[str, Any]:
     return {"fields": compact_fields, "items": compact_items}
 
 
-def _remember_saved_document_for_qa(user_id: int, extracted_json: str, label: str = "saved document") -> None:
+def _remember_saved_document_for_qa(user_id: uuid.UUID, extracted_json: str, label: str = "saved document") -> None:
     """Add the saved OCR payload to NLP context so immediate follow-ups can resolve it."""
     try:
         context_payload = _compact_ocr_payload_for_summary(extracted_json)
@@ -1057,7 +1058,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Extract pending ID from callback data
     _, pending_id = query.data.split(":", 1)
-    pending_id = int(pending_id)
+    pending_id = uuid.UUID(pending_id)
 
     # Get pending document from database
     pending = db_service.get_pending_document_by_id(pending_id, _get_or_create_user(update).id)
@@ -1110,7 +1111,7 @@ async def edit_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Extract pending ID from callback data
     _, pending_id = query.data.split(":", 1)
-    pending_id = int(pending_id)
+    pending_id = uuid.UUID(pending_id)
 
     # Get pending document from database
     pending = db_service.get_pending_document_by_id(pending_id, _get_or_create_user(update).id)

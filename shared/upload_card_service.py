@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from typing import Optional
 
 from google import genai
@@ -146,7 +147,7 @@ class _GeminiSummaryClient:
             logger.exception("Gemini summary call failed")
             return None
 
-    async def whatsapp_review(self, ocr_data: dict, pending_id: int) -> Optional[str]:
+    async def whatsapp_review(self, ocr_data: dict, pending_id: uuid.UUID) -> Optional[str]:
         """Prompt-only: one WhatsApp review bubble with confirm/edit footer."""
         ocr_json = json.dumps(ocr_data, ensure_ascii=False, indent=2)
         message = await self._generate(
@@ -224,7 +225,7 @@ async def build_upload_preview_card(extracted_json: str, confidence: float) -> s
     return f"{border}\n{summary}\n{border}"
 
 
-async def build_whatsapp_review_message(extracted_json: str, pending_id: int) -> str:
+async def build_whatsapp_review_message(extracted_json: str, pending_id: uuid.UUID) -> str:
     """Prompt-only WhatsApp review card (single bubble, includes CONFIRM/EDIT footer)."""
     data = _safe_json_loads(extracted_json)
     clean_data = _strip_internal_fields(data)

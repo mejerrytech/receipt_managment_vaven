@@ -16,7 +16,10 @@ class Settings:
         "Be concise, accurate, and action-oriented. "
         "Match the user's language and script (e.g. Hindi, Hinglish, English) from their latest message. "
         "When they are clearly logging spend in free text vs asking about saved data or totals, behave "
-        "accordingly; for data questions, use conversation context or say you do not know — never invent saves. "
+        "When they are clearly logging spend in free text vs asking about saved data or totals, behave "
+        "accordingly; for data questions, use conversation context. "
+        "If you truly cannot understand the user's message, ask them to repeat clearly — "
+        "never invent receipt data, totals, or saved expenses. "
         "Never use web search or the public internet for receipt/expense answers; only the user's saved data. "
         "Keep replies short for mobile chat."
     )

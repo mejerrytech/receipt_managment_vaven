@@ -4,11 +4,15 @@ import logging
 import secrets
 import re
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-from sqlalchemy import create_engine, inspect, Column, Integer, String, DateTime, Text, ForeignKey, BigInteger, Float, text, or_
+from sqlalchemy import create_engine, inspect, Column, Integer, String, DateTime, Text, ForeignKey, BigInteger, Float, Boolean, text, or_
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.sql import func
+
+from shared.id_types import as_str
 
 from shared.env import load_project_dotenv
 
@@ -37,6 +41,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+def _uuid_pk():
+    return Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+
+def _uuid_fk(column: str = "users.id"):
+    return Column(PG_UUID(as_uuid=True), ForeignKey(column), nullable=False, index=True)
+
+
 def _timestamp_column_type_sql() -> str:
     return "TIMESTAMP WITH TIME ZONE"
 
@@ -53,11 +65,247 @@ def _table_column_names(table_name: str) -> set:
         return set()
 
 
+def _column_is_integer_pk(table_name: str) -> bool:
+    try:
+        insp = inspect(engine)
+        if not insp.has_table(table_name):
+            return False
+        for col in insp.get_columns(table_name):
+            if col["name"].lower() == "id":
+                return "INT" in str(col["type"]).upper()
+        return False
+    except Exception as e:
+        logger.warning("Could not inspect PK type for %s: %s", table_name, e)
+        return False
+
+
+# Legacy migration used predictable UUIDs (e.g. 00000000-0000-4000-8000-000000000002).
+# Detect rows that still use that scheme so we can replace them with random UUIDs.
+_LEGACY_UUID_RE = r"^[0-9a-f]{8}-0000-4000-8000-[0-9a-f]{12}$"
+_LEGACY_UUID_NAMESPACES = {
+    "documents": "10000000",
+    "pending_documents": "20000000",
+    "user_text_entries": "30000000",
+    "prompts": "40000000",
+}
+
+
+def _has_legacy_deterministic_uuids(conn) -> bool:
+    row = conn.execute(
+        text(
+            """
+            SELECT 1 FROM users
+            WHERE id::text ~ :pat
+            LIMIT 1
+            """
+        ),
+        {"pat": _LEGACY_UUID_RE},
+    ).first()
+    return row is not None
+
+
+def _rerandomize_deterministic_uuids() -> None:
+    """Replace predictable migration UUIDs with gen_random_uuid() values."""
+    with engine.connect() as conn:
+        if not _has_legacy_deterministic_uuids(conn):
+            return
+
+    logger.warning("Replacing legacy deterministic UUIDs with random UUIDs")
+    child_tables = ("documents", "pending_documents", "user_text_entries")
+
+    with engine.begin() as conn:
+        conn.execute(text('CREATE EXTENSION IF NOT EXISTS "pgcrypto"'))
+
+        conn.execute(
+            text(
+                """
+                CREATE TEMP TABLE _user_uuid_map AS
+                SELECT id AS old_id, gen_random_uuid() AS new_id
+                FROM users
+                WHERE id::text ~ :pat
+                """
+            ),
+            {"pat": _LEGACY_UUID_RE},
+        )
+
+        for child in child_tables:
+            _drop_table_fk_constraints(conn, child)
+
+        conn.execute(
+            text(
+                """
+                UPDATE users u
+                SET id = m.new_id
+                FROM _user_uuid_map m
+                WHERE u.id = m.old_id
+                """
+            )
+        )
+        for child in child_tables:
+            conn.execute(
+                text(
+                    f"""
+                    UPDATE {child} c
+                    SET user_id = m.new_id
+                    FROM _user_uuid_map m
+                    WHERE c.user_id = m.old_id
+                    """
+                )
+            )
+
+        for table, namespace in _LEGACY_UUID_NAMESPACES.items():
+            if not inspect(engine).has_table(table):
+                continue
+            conn.execute(
+                text(
+                    f"""
+                    UPDATE {table}
+                    SET id = gen_random_uuid()
+                    WHERE id::text LIKE :prefix
+                    """
+                ),
+                {"prefix": f"{namespace}-0000-4000-8000-%"},
+            )
+
+        for child in child_tables:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {child} ADD CONSTRAINT {child}_user_id_fkey "
+                    f"FOREIGN KEY (user_id) REFERENCES users(id)"
+                )
+            )
+
+    logger.info("Legacy deterministic UUIDs replaced with random values")
+
+
+def _column_is_uuid_pk(table_name: str) -> bool:
+    try:
+        insp = inspect(engine)
+        if not insp.has_table(table_name):
+            return False
+        for col in insp.get_columns(table_name):
+            if col["name"].lower() == "id":
+                return "UUID" in str(col["type"]).upper()
+        return False
+    except Exception as e:
+        logger.warning("Could not inspect PK type for %s: %s", table_name, e)
+        return False
+
+
+def _cleanup_partial_uuid_migration(conn) -> None:
+    """Remove leftover columns from an older add-column migration attempt."""
+    for table in ("users", "documents", "pending_documents", "user_text_entries", "prompts"):
+        cols = _table_column_names(table)
+        if "id_new" in cols:
+            conn.execute(text(f"ALTER TABLE {table} DROP COLUMN IF EXISTS id_new"))
+        if table != "users" and "user_id_new" in cols:
+            conn.execute(text(f"ALTER TABLE {table} DROP COLUMN IF EXISTS user_id_new"))
+
+
+def _drop_table_fk_constraints(conn, table_name: str) -> None:
+    rows = conn.execute(
+        text(
+            """
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = CAST(:tbl AS regclass) AND contype = 'f'
+            """
+        ),
+        {"tbl": table_name},
+    ).fetchall()
+    for (conname,) in rows:
+        conn.execute(text(f'ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS "{conname}"'))
+
+
+def _migrate_integer_ids_to_uuid() -> None:
+    """One-time migration: convert integer PK/FK columns to random UUIDs in place.
+
+    Uses a temp mapping table + ALTER COLUMN TYPE so existing primary keys stay
+    valid without creating new constraints (PostgreSQL 15+ public schema limits).
+    """
+    if not _column_is_integer_pk("users"):
+        if _column_is_uuid_pk("users"):
+            _cleanup_partial_uuid_migration_on_connect()
+        return
+
+    logger.warning("Migrating integer primary keys to random UUIDs — this may take a moment")
+    child_tables = ("documents", "pending_documents", "user_text_entries")
+
+    with engine.begin() as conn:
+        conn.execute(text('CREATE EXTENSION IF NOT EXISTS "pgcrypto"'))
+        _cleanup_partial_uuid_migration(conn)
+
+        conn.execute(
+            text(
+                """
+                CREATE TEMP TABLE _int_user_map AS
+                SELECT id AS old_id, gen_random_uuid() AS new_id FROM users
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE OR REPLACE FUNCTION pg_temp.map_user_int(i integer)
+                RETURNS uuid LANGUAGE sql STABLE AS $$
+                    SELECT new_id FROM _int_user_map WHERE old_id = i
+                $$
+                """
+            )
+        )
+
+        for child in child_tables:
+            _drop_table_fk_constraints(conn, child)
+
+        conn.execute(text("ALTER TABLE users ALTER COLUMN id DROP DEFAULT"))
+        conn.execute(
+            text("ALTER TABLE users ALTER COLUMN id TYPE uuid USING (pg_temp.map_user_int(id))")
+        )
+
+        for child in child_tables:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {child} ALTER COLUMN user_id TYPE uuid "
+                    f"USING (pg_temp.map_user_int(user_id))"
+                )
+            )
+            conn.execute(text(f"ALTER TABLE {child} ALTER COLUMN id DROP DEFAULT"))
+            conn.execute(
+                text(f"ALTER TABLE {child} ALTER COLUMN id TYPE uuid USING (gen_random_uuid())")
+            )
+            conn.execute(
+                text(
+                    f"ALTER TABLE {child} ADD CONSTRAINT {child}_user_id_fkey "
+                    f"FOREIGN KEY (user_id) REFERENCES users(id)"
+                )
+            )
+            conn.execute(text(f"DROP SEQUENCE IF EXISTS {child}_id_seq CASCADE"))
+
+        if inspect(engine).has_table("prompts") and _column_is_integer_pk("prompts"):
+            conn.execute(text("ALTER TABLE prompts ALTER COLUMN id DROP DEFAULT"))
+            conn.execute(
+                text("ALTER TABLE prompts ALTER COLUMN id TYPE uuid USING (gen_random_uuid())")
+            )
+            conn.execute(text("DROP SEQUENCE IF EXISTS prompts_id_seq CASCADE"))
+
+        conn.execute(text("DROP SEQUENCE IF EXISTS users_id_seq CASCADE"))
+
+    logger.info("Integer-to-UUID migration completed — reindex ChromaDB if you use vector search")
+
+
+def _cleanup_partial_uuid_migration_on_connect() -> None:
+    """Best-effort cleanup for leftover columns from a failed legacy migration."""
+    try:
+        with engine.begin() as conn:
+            _cleanup_partial_uuid_migration(conn)
+    except Exception as e:
+        logger.debug("Partial UUID migration cleanup skipped: %s", e)
+
+
 class User(Base):
     """User table - stores Telegram user details."""
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = _uuid_pk()
     telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
     first_name = Column(String(255), nullable=True)
     last_name = Column(String(255), nullable=True)
@@ -73,7 +321,7 @@ class User(Base):
 
     def to_dict(self):
         return {
-            "id": self.id,
+            "id": as_str(self.id),
             "telegram_id": self.telegram_id,
             "first_name": self.first_name,
             "last_name": self.last_name,
@@ -87,8 +335,8 @@ class Document(Base):
     """Document table - stores OCR extraction results."""
     __tablename__ = "documents"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    id = _uuid_pk()
+    user_id = _uuid_fk("users.id")
     
     # Document metadata
     file_name = Column(String(500), nullable=True)
@@ -112,6 +360,10 @@ class Document(Base):
     vendor_name = Column(String(255), nullable=True)
     invoice_number = Column(String(100), nullable=True)
     gstin = Column(String(50), nullable=True)
+    gst_amount = Column(Float, nullable=True)
+    igst_amount = Column(Float, nullable=True)
+    cgst_amount = Column(Float, nullable=True)
+    sgst_amount = Column(Float, nullable=True)
     expense_category = Column(String(50), nullable=True)
     user_input_text = Column(Text, nullable=True)
     
@@ -131,8 +383,8 @@ class Document(Base):
 
     def to_dict(self):
         return {
-            "id": self.id,
-            "user_id": self.user_id,
+            "id": as_str(self.id),
+            "user_id": as_str(self.user_id),
             "file_name": self.file_name,
             "mime_type": self.mime_type,
             "file_size": self.file_size,
@@ -146,6 +398,10 @@ class Document(Base):
             "vendor_name": self.vendor_name,
             "invoice_number": self.invoice_number,
             "gstin": self.gstin,
+            "gst_amount": self.gst_amount,
+            "igst_amount": self.igst_amount,
+            "cgst_amount": self.cgst_amount,
+            "sgst_amount": self.sgst_amount,
             "expense_category": self.expense_category,
             "user_input_text": self.user_input_text,
             "confidence_overall": self.confidence_overall,
@@ -158,8 +414,8 @@ class PendingDocument(Base):
     """Pending document table - stores documents awaiting user confirmation."""
     __tablename__ = "pending_documents"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    id = _uuid_pk()
+    user_id = _uuid_fk("users.id")
     
     # Unique token for accessing this pending document (shared across Telegram/Web)
     token = Column(String(100), unique=True, nullable=False, index=True)
@@ -180,6 +436,11 @@ class PendingDocument(Base):
     extracted_data = Column(Text, nullable=True)
     user_input_text = Column(Text, nullable=True)
     expense_category = Column(String(50), nullable=True)
+    gstin = Column(String(50), nullable=True)
+    gst_amount = Column(Float, nullable=True)
+    igst_amount = Column(Float, nullable=True)
+    cgst_amount = Column(Float, nullable=True)
+    sgst_amount = Column(Float, nullable=True)
     
     # Confidence score
     confidence_overall = Column(Float, nullable=True)
@@ -210,9 +471,9 @@ class PendingDocument(Base):
 
     def to_dict(self):
         return {
-            "id": self.id,
+            "id": as_str(self.id),
             "token": self.token,
-            "user_id": self.user_id,
+            "user_id": as_str(self.user_id),
             "source": self.source,
             "file_name": self.file_name,
             "mime_type": self.mime_type,
@@ -220,6 +481,11 @@ class PendingDocument(Base):
             "extracted_data": json.loads(self.extracted_data) if self.extracted_data else None,
             "user_input_text": self.user_input_text,
             "expense_category": self.expense_category,
+            "gstin": self.gstin,
+            "gst_amount": self.gst_amount,
+            "igst_amount": self.igst_amount,
+            "cgst_amount": self.cgst_amount,
+            "sgst_amount": self.sgst_amount,
             "confidence_overall": self.confidence_overall,
             "telegram_chat_id": self.telegram_chat_id,
             "telegram_message_id": self.telegram_message_id,
@@ -239,8 +505,8 @@ class UserTextEntry(Base):
     """User plain-text entries, especially expense-related intents."""
     __tablename__ = "user_text_entries"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    id = _uuid_pk()
+    user_id = _uuid_fk("users.id")
     text = Column(Text, nullable=False)
     source = Column(String(20), nullable=False, default='telegram', index=True)
     intent_tag = Column(String(100), nullable=True)
@@ -253,8 +519,8 @@ class UserTextEntry(Base):
 
     def to_dict(self):
         return {
-            "id": self.id,
-            "user_id": self.user_id,
+            "id": as_str(self.id),
+            "user_id": as_str(self.user_id),
             "text": self.text,
             "source": self.source,
             "intent_tag": self.intent_tag,
@@ -265,12 +531,34 @@ class UserTextEntry(Base):
         }
 
 
+class ExpenseCategory(Base):
+    """Canonical expense categories for OCR, text entries, and UI filters."""
+
+    __tablename__ = "expense_categories"
+
+    id = _uuid_pk()
+    name = Column(String(100), unique=True, nullable=False)
+    slug = Column(String(100), unique=True, nullable=False, index=True)
+    display_order = Column(Integer, nullable=False, default=0)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    def to_dict(self):
+        return {
+            "id": as_str(self.id),
+            "name": self.name,
+            "slug": self.slug,
+            "display_order": self.display_order,
+            "is_active": self.is_active,
+        }
+
+
 class BotPrompt(Base):
     """Editable LLM prompts (e.g. Telegram /q pipeline)."""
 
     __tablename__ = "prompts"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = _uuid_pk()
     prompt_key = Column(String(120), unique=True, nullable=False, index=True)
     label = Column(String(255), nullable=False)
     category = Column(String(64), nullable=False, default="telegram_q")
@@ -282,13 +570,20 @@ class BotPrompt(Base):
 
 def init_db():
     """Initialize database - create all tables."""
-    Base.metadata.create_all(bind=engine)
+    tables_without_categories = [
+        t for name, t in Base.metadata.tables.items() if name != "expense_categories"
+    ]
+    Base.metadata.create_all(bind=engine, tables=tables_without_categories)
+    _migrate_integer_ids_to_uuid()
+    _rerandomize_deterministic_uuids()
     _ensure_hash_columns()
     _ensure_pending_queue_columns()
     _ensure_expense_category_columns()
     _ensure_user_input_text_columns()
     _ensure_user_text_entry_amount_columns()
     _ensure_source_columns()
+    _ensure_gst_tax_columns()
+    _ensure_expense_categories_table()
     _normalize_existing_expense_categories()
     _seed_telegram_q_prompts()
     _migrate_prompts_from_sqlite_wording()
@@ -386,9 +681,113 @@ def _ensure_source_columns():
         conn.commit()
 
 
+def _ensure_gst_tax_columns():
+    """Add GST/tax breakdown columns on documents and pending_documents."""
+    tax_cols = {
+        "gst_amount": "FLOAT",
+        "igst_amount": "FLOAT",
+        "cgst_amount": "FLOAT",
+        "sgst_amount": "FLOAT",
+    }
+    with engine.connect() as conn:
+        for table in ("documents", "pending_documents"):
+            cols = _table_column_names(table)
+            if table == "pending_documents" and "gstin" not in cols:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN gstin VARCHAR(50)"))
+            for col, sql_type in tax_cols.items():
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}"))
+        conn.commit()
+
+
+_DEFAULT_EXPENSE_CATEGORY_NAMES = [
+    "Food and Dining",
+    "Groceries",
+    "Rent",
+    "Utilities",
+    "Fual",
+    "Shopping",
+    "Entertainment",
+    "Healthcare",
+    "Edication",
+    "Personal care",
+    "Subscription",
+    "EMI/Loans",
+    "Insurance",
+    "Investment",
+    "Travel",
+    "Savings",
+    "CAB/Taxi",
+    "Misecellaneous",
+    "Other",
+]
+
+_category_cache: Optional[Dict[str, Any]] = None
+
+
+def _slugify_category(name: str) -> str:
+    s = name.lower().strip().replace("/", " ")
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[\s_]+", "-", s)
+    return s.strip("-") or "other"
+
+
+def _builtin_category_cache() -> Dict[str, Any]:
+    """In-memory category list when expense_categories table is unavailable."""
+    names = list(_DEFAULT_EXPENSE_CATEGORY_NAMES)
+    return {
+        "rows": [],
+        "names": names,
+        "by_name": {n: n for n in names},
+        "by_slug": {_slugify_category(n): n for n in names},
+        "by_lower": {n.lower(): n for n in names},
+        "slug_by_name": {n: _slugify_category(n) for n in names},
+    }
+
+
+def _ensure_expense_categories_table() -> None:
+    """Create public.expense_categories table and seed defaults if empty."""
+    insp = inspect(engine)
+    if not insp.has_table("expense_categories"):
+        try:
+            ExpenseCategory.__table__.create(bind=engine, checkfirst=True)
+        except Exception as e:
+            logger.warning(
+                "Could not create expense_categories table (%s). Using built-in category list.",
+                e,
+            )
+            DatabaseService.invalidate_category_cache()
+            return
+
+    db = SessionLocal()
+    try:
+        count = db.query(ExpenseCategory).count()
+        if count == 0:
+            for order, name in enumerate(_DEFAULT_EXPENSE_CATEGORY_NAMES):
+                db.add(
+                    ExpenseCategory(
+                        name=name,
+                        slug=_slugify_category(name),
+                        display_order=order,
+                        is_active=True,
+                    )
+                )
+            db.commit()
+            logger.info("Seeded %s expense categories", len(_DEFAULT_EXPENSE_CATEGORY_NAMES))
+        else:
+            for row in db.query(ExpenseCategory).filter(
+                or_(ExpenseCategory.slug.is_(None), ExpenseCategory.slug == "")
+            ).all():
+                row.slug = _slugify_category(row.name)
+            db.commit()
+    finally:
+        db.close()
+    DatabaseService.invalidate_category_cache()
+
+
 def _normalize_existing_expense_categories() -> None:
     """Normalize legacy/invalid expense_category values to canonical list or Other."""
-    valid = set(DatabaseService.EXPENSE_CATEGORIES)
+    valid = set(DatabaseService.list_expense_category_names())
     with engine.begin() as conn:
         docs = conn.execute(
             text("SELECT id, expense_category FROM documents WHERE expense_category IS NOT NULL")
@@ -613,38 +1012,109 @@ def get_db():
 class DatabaseService:
     """Service class for database operations."""
 
-    EXPENSE_CATEGORIES = [
-        "Food and Dining",
-        "Groceries",
-        "Rent",
-        "Utilities",
-        "Fual",
-        "Shopping",
-        "Entertainment",
-        "Healthcare",
-        "Edication",
-        "Personal care",
-        "Subscription",
-        "EMI/Loans",
-        "Insurance",
-        "Investment",
-        "Travel",
-        "Savings",
-        "CAB/Taxi",
-        "Misecellaneous",
-        "Other",
-    ]
+    @staticmethod
+    def invalidate_category_cache() -> None:
+        global _category_cache
+        _category_cache = None
+
+    @staticmethod
+    def _load_category_cache() -> Dict[str, Any]:
+        global _category_cache
+        if _category_cache is not None:
+            return _category_cache
+
+        if not inspect(engine).has_table("expense_categories"):
+            _category_cache = _builtin_category_cache()
+            return _category_cache
+
+        db = get_db()
+        try:
+            rows = (
+                db.query(ExpenseCategory)
+                .filter(ExpenseCategory.is_active.is_(True))
+                .order_by(ExpenseCategory.display_order, ExpenseCategory.name)
+                .all()
+            )
+            if not rows:
+                _category_cache = _builtin_category_cache()
+                return _category_cache
+
+            names = [r.name for r in rows]
+            by_name = {r.name: r.name for r in rows}
+            by_slug = {r.slug.lower(): r.name for r in rows}
+            by_lower = {r.name.lower(): r.name for r in rows}
+            slug_by_name = {r.name: r.slug for r in rows}
+            _category_cache = {
+                "rows": rows,
+                "names": names,
+                "by_name": by_name,
+                "by_slug": by_slug,
+                "by_lower": by_lower,
+                "slug_by_name": slug_by_name,
+            }
+            return _category_cache
+        except Exception as e:
+            logger.warning(
+                "Could not load expense_categories from DB (%s); using built-in list.",
+                e,
+            )
+            _category_cache = _builtin_category_cache()
+            return _category_cache
+        finally:
+            db.close()
+
+    @staticmethod
+    def list_expense_category_names() -> List[str]:
+        return list(DatabaseService._load_category_cache()["names"])
+
+    @staticmethod
+    def list_expense_categories() -> List[Dict[str, Any]]:
+        """Return active categories with id, name, slug (for API / UI)."""
+        cache = DatabaseService._load_category_cache()
+        if cache["rows"]:
+            return [r.to_dict() for r in cache["rows"]]
+        return [
+            {
+                "id": None,
+                "name": name,
+                "slug": _slugify_category(name),
+                "display_order": idx,
+                "is_active": True,
+            }
+            for idx, name in enumerate(cache["names"])
+        ]
+
+    @staticmethod
+    def get_expense_categories_for_ai() -> List[str]:
+        """Category names sent to OCR / NLP models."""
+        return DatabaseService.list_expense_category_names()
+
+    @staticmethod
+    def get_category_slug(name: str) -> str:
+        cache = DatabaseService._load_category_cache()
+        return cache["slug_by_name"].get(name, _slugify_category(name))
 
     @staticmethod
     def normalize_expense_category_label(raw: Optional[str]) -> str:
-        """Map any model/OCR string to a canonical value in EXPENSE_CATEGORIES."""
+        """Map name, slug, or alias to canonical category name from DB."""
         c = (raw or "").strip()
         if not c:
             return "Other"
-        if c in DatabaseService.EXPENSE_CATEGORIES:
+        cache = DatabaseService._load_category_cache()
+        if c in cache["by_name"]:
             return c
-        by_lower = {x.lower(): x for x in DatabaseService.EXPENSE_CATEGORIES}
+        slug_key = c.lower().replace("_", "-")
+        if slug_key in cache["by_slug"]:
+            return cache["by_slug"][slug_key]
+        by_lower = cache["by_lower"]
         return by_lower.get(c.lower(), "Other")
+
+    @staticmethod
+    def resolve_category_filter(raw: Optional[str]) -> Optional[str]:
+        """Resolve API ?category= (name or slug) to canonical name."""
+        if not raw or not str(raw).strip():
+            return None
+        return DatabaseService.normalize_expense_category_label(raw)
 
     @staticmethod
     def _resolve_document_expense_category(
@@ -697,12 +1167,8 @@ class DatabaseService:
         return "Other"
 
     @staticmethod
-    def list_expense_categories() -> List[str]:
-        return list(DatabaseService.EXPENSE_CATEGORIES)
-
-    @staticmethod
     def get_user_expense_items(
-        user_id: int,
+        user_id: uuid.UUID,
         category: Optional[str] = None,
         source: Optional[str] = None,
         limit: int = 200,
@@ -723,7 +1189,7 @@ class DatabaseService:
                 items.append({
                     "source": "document",
                     "channel": doc.source or "telegram",
-                    "id": doc.id,
+                    "id": as_str(doc.id),
                     "expense_category": cat,
                     "payment": doc.total_amount,
                     "currency": doc.currency or "INR",
@@ -748,7 +1214,7 @@ class DatabaseService:
                 items.append({
                     "source": "text",
                     "channel": entry.source or "telegram",
-                    "id": entry.id,
+                    "id": as_str(entry.id),
                     "expense_category": cat,
                     "payment": entry.amount,
                     "currency": entry.currency or "INR",
@@ -760,7 +1226,7 @@ class DatabaseService:
                 })
 
             if category:
-                norm = DatabaseService.normalize_expense_category_label(category)
+                norm = DatabaseService.resolve_category_filter(category)
                 items = [i for i in items if i["expense_category"] == norm]
             if source:
                 source_norm = source.strip().lower()
@@ -773,7 +1239,7 @@ class DatabaseService:
 
     @staticmethod
     def update_document_expense_category(
-        doc_id: int, user_id: int, expense_category: str
+        doc_id: uuid.UUID, user_id: uuid.UUID, expense_category: str
     ) -> Optional[Document]:
         """Update category on a saved document and refresh vector metadata."""
         db = get_db()
@@ -867,7 +1333,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def get_user_by_id(user_id: int) -> Optional[User]:
+    def get_user_by_id(user_id: uuid.UUID) -> Optional[User]:
         """Fetch user by internal users.id."""
         db = get_db()
         try:
@@ -894,7 +1360,82 @@ class DatabaseService:
         return None
 
     @staticmethod
-    def backfill_document_vendor_names(user_id: int) -> int:
+    def _float_or_none(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def extract_tax_fields_from_ocr(data: Any) -> Dict[str, Any]:
+        """Parse GST number and tax breakdown from OCR JSON."""
+        if not isinstance(data, dict):
+            return {
+                "gstin": None,
+                "gst_amount": None,
+                "igst_amount": None,
+                "cgst_amount": None,
+                "sgst_amount": None,
+            }
+
+        amounts = data.get("amounts") if isinstance(data.get("amounts"), dict) else {}
+        identifiers = data.get("identifiers") if isinstance(data.get("identifiers"), dict) else {}
+        taxes = data.get("taxes") if isinstance(data.get("taxes"), dict) else {}
+        vendor = data.get("vendor_or_sender") if isinstance(data.get("vendor_or_sender"), dict) else {}
+
+        gstin_raw = (
+            identifiers.get("gstin")
+            or identifiers.get("gst_number")
+            or identifiers.get("gst_no")
+            or data.get("gstin")
+            or data.get("gst_number")
+            or vendor.get("gstin")
+        )
+        gstin = str(gstin_raw).strip() if gstin_raw else None
+
+        igst = DatabaseService._float_or_none(
+            taxes.get("igst") or taxes.get("IGST") or amounts.get("igst") or amounts.get("IGST")
+        )
+        cgst = DatabaseService._float_or_none(
+            taxes.get("cgst") or taxes.get("CGST") or amounts.get("cgst") or amounts.get("CGST")
+        )
+        sgst = DatabaseService._float_or_none(
+            taxes.get("sgst") or taxes.get("SGST") or amounts.get("sgst") or amounts.get("SGST")
+        )
+        gst_amount = DatabaseService._float_or_none(
+            amounts.get("gst")
+            or amounts.get("gst_amount")
+            or amounts.get("tax")
+            or amounts.get("total_tax")
+            or taxes.get("total")
+            or taxes.get("gst")
+            or taxes.get("total_gst")
+        )
+
+        if gst_amount is None and cgst is not None and sgst is not None:
+            gst_amount = round(cgst + sgst, 2)
+        elif gst_amount is None and igst is not None:
+            gst_amount = igst
+
+        return {
+            "gstin": gstin,
+            "gst_amount": gst_amount,
+            "igst_amount": igst,
+            "cgst_amount": cgst,
+            "sgst_amount": sgst,
+        }
+
+    @staticmethod
+    def _apply_tax_fields_to_model(model: Any, data: Any) -> None:
+        tax = DatabaseService.extract_tax_fields_from_ocr(data)
+        for key, value in tax.items():
+            if hasattr(model, key):
+                setattr(model, key, value)
+
+    @staticmethod
+    def backfill_document_vendor_names(user_id: uuid.UUID) -> int:
         """Populate documents.vendor_name from OCR JSON when the column is empty."""
         db = get_db()
         updated = 0
@@ -930,7 +1471,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def save_document(user_id: int, file_name: Optional[str], mime_type: Optional[str],
+    def save_document(user_id: uuid.UUID, file_name: Optional[str], mime_type: Optional[str],
                       file_size: Optional[int], extracted_json: str,
                       raw_text: Optional[str] = None,
                       user_input_text: Optional[str] = None,
@@ -961,7 +1502,8 @@ class DatabaseService:
                 total_amount = data.get("total_amount")
             currency = amounts.get("currency") or data.get("currency")
             invoice_number = identifiers.get("invoice_number") or data.get("bill_number")
-            gstin = identifiers.get("gstin") or data.get("gstin")
+            tax = DatabaseService.extract_tax_fields_from_ocr(data)
+            gstin = tax["gstin"]
             merged_input_text = " ".join([x for x in [raw_text, user_input_text] if x]).strip() or None
             classified_category = DatabaseService._infer_document_expense_category(
                 data, merged_input_text, file_name
@@ -988,6 +1530,10 @@ class DatabaseService:
                 vendor_name=vendor_name,
                 invoice_number=invoice_number,
                 gstin=gstin,
+                gst_amount=tax["gst_amount"],
+                igst_amount=tax["igst_amount"],
+                cgst_amount=tax["cgst_amount"],
+                sgst_amount=tax["sgst_amount"],
                 expense_category=classified_category,
                 user_input_text=user_input_text,
                 confidence_overall=confidence.get("overall"),
@@ -1013,10 +1559,10 @@ class DatabaseService:
     @staticmethod
     def _vector_payload_from_document(doc: Document) -> Dict[str, Any]:
         """Shape expected by vector_service._document_to_text (extracted_json key)."""
-        user = DatabaseService.get_user_by_id(int(doc.user_id))
+        user = DatabaseService.get_user_by_id(doc.user_id)
         username = (getattr(user, "username", None) or "").strip() if user else ""
         return {
-            "id": doc.id,
+            "id": as_str(doc.id),
             "user_id": doc.user_id,
             "username": username,
             "file_name": doc.file_name,
@@ -1038,7 +1584,7 @@ class DatabaseService:
         vs = get_vector_service()
         payload = DatabaseService._vector_payload_from_document(doc)
         for i in range(attempts):
-            if vs.add_document(int(doc.id), int(doc.user_id), payload):
+            if vs.add_document(doc.id, doc.user_id, payload):
                 return True
             logger.warning(
                 "Vector upsert attempt %s/%s failed for document id=%s",
@@ -1060,12 +1606,12 @@ class DatabaseService:
     @staticmethod
     def index_user_text_entry_in_vector(entry: UserTextEntry, attempts: int = 3) -> bool:
         vs = get_vector_service()
-        user = DatabaseService.get_user_by_id(int(entry.user_id))
+        user = DatabaseService.get_user_by_id(entry.user_id)
         username = (getattr(user, "username", None) or "").strip() if user else ""
         for i in range(attempts):
             if vs.add_user_text_entry(
-                entry_id=int(entry.id),
-                user_id=int(entry.user_id),
+                entry_id=entry.id,
+                user_id=entry.user_id,
                 text=entry.text,
                 intent_tag=entry.intent_tag or "expense_text",
                 expense_category=entry.expense_category,
@@ -1087,7 +1633,159 @@ class DatabaseService:
         return False
 
     @staticmethod
-    def reindex_document_vector(doc_id: int, user_id: int) -> bool:
+    def _vector_payload_from_pending(pending: PendingDocument) -> Dict[str, Any]:
+        """Shape for vector_service.add_pending_document."""
+        user = DatabaseService.get_user_by_id(pending.user_id)
+        username = (getattr(user, "username", None) or "").strip() if user else ""
+        data: Dict[str, Any] = {}
+        if pending.extracted_data:
+            try:
+                parsed = json.loads(pending.extracted_data)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        amounts = data.get("amounts") if isinstance(data.get("amounts"), dict) else {}
+        return {
+            "user_id": pending.user_id,
+            "username": username,
+            "file_name": pending.file_name,
+            "source": pending.source,
+            "title": pending.file_name,
+            "vendor_name": DatabaseService._vendor_name_from_ocr_data(data),
+            "expense_category": pending.expense_category or data.get("expense_category"),
+            "user_input_text": pending.user_input_text,
+            "total_amount": amounts.get("total"),
+            "extracted_json": pending.extracted_data,
+            "status": "pending",
+        }
+
+    @staticmethod
+    def reindex_user_vectors(
+        user_id: uuid.UUID,
+        *,
+        include_pending: bool = True,
+        purge_first: bool = True,
+    ) -> Dict[str, Any]:
+        """Rebuild Chroma embeddings for one user from PostgreSQL (per-user guardrails)."""
+        user = DatabaseService.get_user_by_id(user_id)
+        if not user:
+            return {"error": "user not found", "user_id": as_str(user_id)}
+
+        vs = get_vector_service()
+        stats: Dict[str, Any] = {
+            "user_id": as_str(user_id),
+            "username": user.username,
+            "telegram_id": user.telegram_id,
+            "purged": 0,
+            "documents_ok": 0,
+            "documents_fail": 0,
+            "text_entries_ok": 0,
+            "text_entries_fail": 0,
+            "pending_ok": 0,
+            "pending_fail": 0,
+        }
+
+        if purge_first:
+            stats["purged"] = vs.purge_user_vectors(user_id)
+
+        db = get_db()
+        try:
+            docs = db.query(Document).filter(Document.user_id == user_id).order_by(Document.created_at).all()
+            for doc in docs:
+                if DatabaseService.index_document_in_vector_store(doc):
+                    stats["documents_ok"] += 1
+                else:
+                    stats["documents_fail"] += 1
+
+            texts = (
+                db.query(UserTextEntry)
+                .filter(UserTextEntry.user_id == user_id)
+                .order_by(UserTextEntry.created_at)
+                .all()
+            )
+            for entry in texts:
+                if DatabaseService.index_user_text_entry_in_vector(entry):
+                    stats["text_entries_ok"] += 1
+                else:
+                    stats["text_entries_fail"] += 1
+
+            if include_pending:
+                pendings = (
+                    db.query(PendingDocument)
+                    .filter(
+                        PendingDocument.user_id == user_id,
+                        PendingDocument.status.in_(["pending", "processing", "ready"]),
+                    )
+                    .order_by(PendingDocument.created_at)
+                    .all()
+                )
+                for pending in pendings:
+                    payload = DatabaseService._vector_payload_from_pending(pending)
+                    if vs.add_pending_document(pending.id, pending.user_id, payload):
+                        stats["pending_ok"] += 1
+                    else:
+                        stats["pending_fail"] += 1
+        finally:
+            db.close()
+
+        stats["total_indexed"] = (
+            stats["documents_ok"] + stats["text_entries_ok"] + stats["pending_ok"]
+        )
+        stats["total_failed"] = (
+            stats["documents_fail"] + stats["text_entries_fail"] + stats["pending_fail"]
+        )
+        return stats
+
+    @staticmethod
+    def reindex_all_users_vectors(
+        *,
+        include_pending: bool = True,
+        purge_first: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Rebuild Chroma embeddings for every user."""
+        db = get_db()
+        try:
+            users = db.query(User).order_by(User.created_at).all()
+        finally:
+            db.close()
+
+        results: List[Dict[str, Any]] = []
+        for user in users:
+            results.append(
+                DatabaseService.reindex_user_vectors(
+                    user.id,
+                    include_pending=include_pending,
+                    purge_first=purge_first,
+                )
+            )
+        return results
+
+    @staticmethod
+    def count_user_vector_sources(user_id: uuid.UUID) -> Dict[str, int]:
+        """Count SQL rows that would be embedded for a user (dry-run helper)."""
+        db = get_db()
+        try:
+            doc_count = db.query(Document).filter(Document.user_id == user_id).count()
+            text_count = db.query(UserTextEntry).filter(UserTextEntry.user_id == user_id).count()
+            pending_count = (
+                db.query(PendingDocument)
+                .filter(
+                    PendingDocument.user_id == user_id,
+                    PendingDocument.status.in_(["pending", "processing", "ready"]),
+                )
+                .count()
+            )
+            return {
+                "documents": doc_count,
+                "text_entries": text_count,
+                "pending": pending_count,
+            }
+        finally:
+            db.close()
+
+    @staticmethod
+    def reindex_document_vector(doc_id: uuid.UUID, user_id: uuid.UUID) -> bool:
         """Reload document from SQL and push to Chroma (recovery after failed indexing)."""
         doc = DatabaseService.get_document_by_id(doc_id, user_id)
         if not doc:
@@ -1096,45 +1794,8 @@ class DatabaseService:
         return DatabaseService.index_document_in_vector_store(doc)
 
     @staticmethod
-    def find_documents_matching_query_tokens(user_id: int, query: str, limit: int = 10) -> List[Document]:
-        """
-        SQL substring fallback for /q when embedding search misses (vendor name in JSON, etc.).
-        Matches vendor_name, title, raw_text, extracted_data using meaningful tokens from the question.
-        """
-        q = (query or "").strip()
-        if len(q) < 2:
-            return []
-        words = re.findall(r"[A-Za-z][\w.-]{2,}", q)
-        needles: List[str] = []
-        if words:
-            needles.append(max(words, key=len).lower())
-        needles.extend([w.lower() for w in words if len(w) >= 4])
-        needles = list(dict.fromkeys(needles))[:8]
-        if not needles:
-            needles = [q[:120].lower()]
-        db = get_db()
-        try:
-            conds = []
-            for n in needles:
-                pat = f"%{n}%"
-                conds.append(Document.vendor_name.ilike(pat))
-                conds.append(Document.title.ilike(pat))
-                conds.append(Document.raw_text.ilike(pat))
-                conds.append(Document.extracted_data.ilike(pat))
-            return (
-                db.query(Document)
-                .filter(Document.user_id == user_id)
-                .filter(or_(*conds))
-                .order_by(Document.created_at.desc())
-                .limit(limit)
-                .all()
-            )
-        finally:
-            db.close()
-
-    @staticmethod
     def save_user_text_entry(
-        user_id: int,
+        user_id: uuid.UUID,
         user_text: str,
         intent_tag: str = "expense_text",
         expense_category: Optional[str] = None,
@@ -1199,7 +1860,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def get_user_documents(user_id: int, limit: int = 50):
+    def get_user_documents(user_id: uuid.UUID, limit: int = 50):
         """Get all documents for a user."""
         db = get_db()
         try:
@@ -1210,7 +1871,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def get_document_by_id(doc_id: int, user_id: int) -> Optional[Document]:
+    def get_document_by_id(doc_id: uuid.UUID, user_id: uuid.UUID) -> Optional[Document]:
         """Get specific document by ID (with user verification)."""
         db = get_db()
         try:
@@ -1222,7 +1883,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def fetch_documents_for_vector_enrichment(user_id: int, doc_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    def fetch_documents_for_vector_enrichment(user_id: uuid.UUID, doc_ids: List[uuid.UUID]) -> Dict[uuid.UUID, Dict[str, Any]]:
         """Batch-load documents for semantic / vector search enrichment."""
         if not doc_ids:
             return {}
@@ -1233,10 +1894,10 @@ class DatabaseService:
                 .filter(Document.user_id == user_id, Document.id.in_(doc_ids))
                 .all()
             )
-            out: Dict[int, Dict[str, Any]] = {}
+            out: Dict[uuid.UUID, Dict[str, Any]] = {}
             for d in docs:
                 out[d.id] = {
-                    "id": d.id,
+                    "id": as_str(d.id),
                 "source": d.source,
                     "document_type": d.document_type,
                     "title": d.title,
@@ -1252,8 +1913,8 @@ class DatabaseService:
 
     @staticmethod
     def fetch_user_text_entries_for_vector_enrichment(
-        user_id: int, entry_ids: List[int]
-    ) -> Dict[int, Dict[str, Any]]:
+        user_id: uuid.UUID, entry_ids: List[uuid.UUID]
+    ) -> Dict[uuid.UUID, Dict[str, Any]]:
         """Batch-load manual text expense rows for vector enrichment."""
         if not entry_ids:
             return {}
@@ -1264,10 +1925,10 @@ class DatabaseService:
                 .filter(UserTextEntry.user_id == user_id, UserTextEntry.id.in_(entry_ids))
                 .all()
             )
-            out: Dict[int, Dict[str, Any]] = {}
+            out: Dict[uuid.UUID, Dict[str, Any]] = {}
             for t in rows:
                 out[t.id] = {
-                    "id": t.id,
+                    "id": as_str(t.id),
                     "text": t.text,
                 "source": t.source,
                     "amount": t.amount,
@@ -1280,7 +1941,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def get_distinct_vendor_names(user_id: int, limit: int = 500) -> List[str]:
+    def get_distinct_vendor_names(user_id: uuid.UUID, limit: int = 500) -> List[str]:
         """Distinct vendor names for a user (vendor_name column + OCR JSON fallback)."""
         DatabaseService.backfill_document_vendor_names(user_id)
         db = get_db()
@@ -1315,11 +1976,11 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def count_unique_vendors_for_user(user_id: int) -> int:
+    def count_unique_vendors_for_user(user_id: uuid.UUID) -> int:
         return len(DatabaseService.get_distinct_vendor_names(user_id))
 
     @staticmethod
-    def get_user_summary_stats(user_id: int) -> dict:
+    def get_user_summary_stats(user_id: uuid.UUID) -> dict:
         """Get summary statistics for user's documents."""
         db = get_db()
         try:
@@ -1357,7 +2018,7 @@ class DatabaseService:
                 "document_types": [{"type": t[0] or "unknown", "count": t[1]} for t in doc_types],
                 "recent_documents": [
                     {
-                        "id": d.id,
+                        "id": as_str(d.id),
                         "title": d.title or d.file_name or "Untitled",
                         "type": d.document_type or "document",
                         "amount": d.total_amount,
@@ -1370,7 +2031,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def create_pending_document(user_id: int, file_name: Optional[str], mime_type: Optional[str],
+    def create_pending_document(user_id: uuid.UUID, file_name: Optional[str], mime_type: Optional[str],
                                 file_size: Optional[int], extracted_json: str,
                                 confidence_overall: Optional[float] = None,
                                 user_input_text: Optional[str] = None,
@@ -1406,6 +2067,24 @@ class DatabaseService:
             )
             parsed["expense_category"] = pending_category
             extracted_json = json.dumps(parsed, ensure_ascii=False)
+
+            now = datetime.utcnow()
+            has_ocr_result = bool(
+                extracted_json and extracted_json.strip() not in ("", "{}", "null")
+            )
+            effective_job_id = ocr_job_id
+            ocr_started = None
+            ocr_completed = None
+
+            if status == "processing":
+                ocr_started = now
+            elif has_ocr_result and status in ("pending", "ready"):
+                ocr_started = now
+                ocr_completed = now
+                if not effective_job_id:
+                    effective_job_id = "sync"
+
+            tax = DatabaseService.extract_tax_fields_from_ocr(parsed)
             
             pending = PendingDocument(
                 user_id=user_id,
@@ -1421,13 +2100,19 @@ class DatabaseService:
                 extracted_data=extracted_json,
                 user_input_text=user_input_text,
                 expense_category=pending_category,
+                gstin=tax["gstin"],
+                gst_amount=tax["gst_amount"],
+                igst_amount=tax["igst_amount"],
+                cgst_amount=tax["cgst_amount"],
+                sgst_amount=tax["sgst_amount"],
                 confidence_overall=confidence_overall,
                 telegram_chat_id=telegram_chat_id,
                 telegram_message_id=telegram_message_id,
                 telegram_file_id=telegram_file_id,
                 status=status,
-                ocr_job_id=ocr_job_id,
-                ocr_started_at=datetime.utcnow() if status == 'processing' else None,
+                ocr_job_id=effective_job_id,
+                ocr_started_at=ocr_started,
+                ocr_completed_at=ocr_completed,
                 expires_at=expires_at
             )
             
@@ -1456,7 +2141,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def get_pending_document_by_id(pending_id: int, user_id: int) -> Optional[PendingDocument]:
+    def get_pending_document_by_id(pending_id: uuid.UUID, user_id: uuid.UUID) -> Optional[PendingDocument]:
         """Get pending document by ID (with user verification)."""
         db = get_db()
         try:
@@ -1469,7 +2154,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def get_pending_document_for_job(pending_id: int) -> Optional[PendingDocument]:
+    def get_pending_document_for_job(pending_id: uuid.UUID) -> Optional[PendingDocument]:
         """Get pending document for background processing regardless of user/session."""
         db = get_db()
         try:
@@ -1478,7 +2163,22 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def get_user_pending_documents(user_id: int, limit: int = 20):
+    def get_user_text_entries(user_id: uuid.UUID, limit: int = 50):
+        """Get manual text expense entries for a user."""
+        db = get_db()
+        try:
+            return (
+                db.query(UserTextEntry)
+                .filter(UserTextEntry.user_id == user_id)
+                .order_by(UserTextEntry.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+        finally:
+            db.close()
+
+    @staticmethod
+    def get_user_pending_documents(user_id: uuid.UUID, limit: int = 20):
         """Get all pending documents for a user."""
         db = get_db()
         try:
@@ -1491,7 +2191,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def confirm_pending_document(pending_id: int) -> Optional[Document]:
+    def confirm_pending_document(pending_id: uuid.UUID) -> Optional[Document]:
         """Confirm a pending document and save it to the documents table."""
         db = get_db()
         try:
@@ -1534,7 +2234,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def update_pending_document(pending_id: int, updated_json: str) -> Optional[PendingDocument]:
+    def update_pending_document(pending_id: uuid.UUID, updated_json: str) -> Optional[PendingDocument]:
         """Update the extracted data of a pending document."""
         db = get_db()
         try:
@@ -1561,6 +2261,7 @@ class DatabaseService:
                 parsed["expense_category"] = cat
                 pending.expense_category = cat
                 pending.extracted_data = json.dumps(parsed, ensure_ascii=False)
+                DatabaseService._apply_tax_fields_to_model(pending, parsed)
             db.commit()
             db.refresh(pending)
             
@@ -1574,7 +2275,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def count_user_inflight_pending_documents(user_id: int) -> int:
+    def count_user_inflight_pending_documents(user_id: uuid.UUID) -> int:
         """Count pending OCR jobs currently in processing state for a user."""
         db = get_db()
         try:
@@ -1586,7 +2287,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def set_pending_job_id(pending_id: int, job_id: str) -> Optional[PendingDocument]:
+    def set_pending_job_id(pending_id: uuid.UUID, job_id: str) -> Optional[PendingDocument]:
         """Attach Celery job id to pending document."""
         db = get_db()
         try:
@@ -1594,6 +2295,8 @@ class DatabaseService:
             if not pending:
                 return None
             pending.ocr_job_id = job_id
+            if not pending.ocr_started_at:
+                pending.ocr_started_at = datetime.utcnow()
             db.commit()
             db.refresh(pending)
             return pending
@@ -1605,7 +2308,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def set_pending_telegram_message_id(pending_id: int, message_id: int) -> Optional[PendingDocument]:
+    def set_pending_telegram_message_id(pending_id: uuid.UUID, message_id: int) -> Optional[PendingDocument]:
         """Persist Telegram message id linked to the pending workflow."""
         db = get_db()
         try:
@@ -1624,7 +2327,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def mark_pending_ocr_ready(pending_id: int, extracted_json: str, confidence_overall: Optional[float]) -> Optional[PendingDocument]:
+    def mark_pending_ocr_ready(pending_id: uuid.UUID, extracted_json: str, confidence_overall: Optional[float]) -> Optional[PendingDocument]:
         """Mark pending OCR job complete and ready for user confirmation."""
         db = get_db()
         try:
@@ -1646,9 +2349,12 @@ class DatabaseService:
             parsed["expense_category"] = category
             pending.extracted_data = json.dumps(parsed, ensure_ascii=False)
             pending.expense_category = category
+            DatabaseService._apply_tax_fields_to_model(pending, parsed)
             pending.confidence_overall = confidence_overall
             pending.status = 'ready'
             pending.error_message = None
+            if not pending.ocr_started_at:
+                pending.ocr_started_at = datetime.utcnow()
             pending.ocr_completed_at = datetime.utcnow()
             db.commit()
             db.refresh(pending)
@@ -1661,7 +2367,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def mark_pending_ocr_failed(pending_id: int, error_message: str, retry_count: int = 0) -> Optional[PendingDocument]:
+    def mark_pending_ocr_failed(pending_id: uuid.UUID, error_message: str, retry_count: int = 0) -> Optional[PendingDocument]:
         """Mark pending OCR job failed after retries."""
         db = get_db()
         try:
@@ -1740,7 +2446,7 @@ class DatabaseService:
         }
 
     @staticmethod
-    def find_duplicate_image_for_user(user_id: int,
+    def find_duplicate_image_for_user(user_id: uuid.UUID,
                                       telegram_file_unique_id: Optional[str] = None,
                                       content_sha256: Optional[str] = None,
                                       dhash: Optional[str] = None,
@@ -1825,7 +2531,7 @@ class DatabaseService:
                 if dd <= max_dhash_distance and pd <= max_phash_distance:
                     return {
                         "source": "documents",
-                        "id": d.id,
+                        "id": as_str(d.id),
                         "file_name": d.file_name,
                         "created_at": d.created_at.isoformat() if d.created_at else None,
                         "dhash_distance": dd,
@@ -1856,7 +2562,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def find_duplicate_by_extracted_fingerprint(user_id: int, extracted_json: str) -> Optional[dict]:
+    def find_duplicate_by_extracted_fingerprint(user_id: uuid.UUID, extracted_json: str) -> Optional[dict]:
         """
         Fallback duplicate detection using OCR-extracted business fields.
         Useful when Telegram file identifiers/bytes differ across uploads.
@@ -1893,11 +2599,11 @@ class DatabaseService:
                 )
                 # Strong signals
                 if invoice_number and e_invoice and invoice_number == e_invoice and (amount_match or (vendor and e_vendor and vendor == e_vendor)):
-                    return {"source": "documents", "id": d.id, "file_name": d.file_name, "match_type": "ocr_fingerprint_invoice"}
+                    return {"source": "documents", "id": as_str(d.id), "file_name": d.file_name, "match_type": "ocr_fingerprint_invoice"}
                 if vendor and e_vendor and vendor == e_vendor and amount_match and date and e_date and date == e_date:
-                    return {"source": "documents", "id": d.id, "file_name": d.file_name, "match_type": "ocr_fingerprint_vendor_amount_date"}
+                    return {"source": "documents", "id": as_str(d.id), "file_name": d.file_name, "match_type": "ocr_fingerprint_vendor_amount_date"}
                 if title and e_title and title == e_title and amount_match and date and e_date and date == e_date:
-                    return {"source": "documents", "id": d.id, "file_name": d.file_name, "match_type": "ocr_fingerprint_title_amount_date"}
+                    return {"source": "documents", "id": as_str(d.id), "file_name": d.file_name, "match_type": "ocr_fingerprint_title_amount_date"}
 
             pending_docs = db.query(PendingDocument).filter(
                 PendingDocument.user_id == user_id,
@@ -1929,7 +2635,7 @@ class DatabaseService:
             db.close()
 
     @staticmethod
-    def cancel_pending_document(pending_id: int) -> bool:
+    def cancel_pending_document(pending_id: uuid.UUID) -> bool:
         """Cancel a pending document."""
         db = get_db()
         try:
@@ -2009,6 +2715,8 @@ class DatabaseService:
         out: List[Dict[str, Any]] = []
         for r in rows:
             d = dict(r)
+            if d.get("id") is not None:
+                d["id"] = as_str(d["id"])
             for key in ("created_at", "updated_at"):
                 v = d.get(key)
                 if v is not None and hasattr(v, "isoformat"):

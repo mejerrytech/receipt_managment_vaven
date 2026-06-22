@@ -1,4 +1,5 @@
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import sys
@@ -52,34 +53,39 @@ except ModuleNotFoundError:
 class TestOCRTasks(unittest.TestCase):
     def setUp(self):
         self.task_self = SimpleNamespace(request=SimpleNamespace(retries=0))
+        self.user_a = uuid.uuid4()
+        self.user_b = uuid.uuid4()
+        self.pending_a = uuid.uuid4()
+        self.pending_b = uuid.uuid4()
+        self.pending_c = uuid.uuid4()
 
     def test_process_pending_ocr_skips_already_ready(self):
         pending = SimpleNamespace(
-            id=10,
+            id=self.pending_a,
             status="ready",
-            user_id=1,
+            user_id=self.user_a,
             telegram_file_id="abc",
             telegram_chat_id=123,
             mime_type="image/jpeg",
         )
         with patch.object(ocr_tasks, "db_service") as db:
             db.get_pending_document_for_job.return_value = pending
-            result = ocr_tasks.process_pending_ocr.run(self.task_self, 10, 1)
+            result = ocr_tasks.process_pending_ocr.run(self.task_self, self.pending_a, self.user_a)
             self.assertTrue(result["success"])
             self.assertEqual(result["reason"], "already_processed")
 
     def test_process_pending_ocr_marks_missing_file_id_failed(self):
         pending = SimpleNamespace(
-            id=11,
+            id=self.pending_b,
             status="processing",
-            user_id=1,
+            user_id=self.user_a,
             telegram_file_id=None,
             telegram_chat_id=123,
             mime_type="image/jpeg",
         )
         with patch.object(ocr_tasks, "db_service") as db, patch.object(ocr_tasks, "_send_telegram_failure") as send_fail:
             db.get_pending_document_for_job.return_value = pending
-            result = ocr_tasks.process_pending_ocr.run(self.task_self, 11, 1)
+            result = ocr_tasks.process_pending_ocr.run(self.task_self, self.pending_b, self.user_a)
             self.assertFalse(result["success"])
             self.assertEqual(result["reason"], "missing_telegram_file_id")
             db.mark_pending_ocr_failed.assert_called_once()
@@ -87,9 +93,9 @@ class TestOCRTasks(unittest.TestCase):
 
     def test_process_pending_ocr_duplicate_after_ocr(self):
         pending = SimpleNamespace(
-            id=12,
+            id=self.pending_c,
             status="processing",
-            user_id=7,
+            user_id=self.user_b,
             telegram_file_id="tg-file",
             telegram_chat_id=555,
             mime_type="image/jpeg",
@@ -99,9 +105,9 @@ class TestOCRTasks(unittest.TestCase):
              patch.object(ocr_tasks, "_send_telegram_info") as send_info:
             db.get_pending_document_for_job.return_value = pending
             run.return_value = '{"document_type":"invoice"}'
-            db.find_duplicate_by_extracted_fingerprint.return_value = {"id": 99}
+            db.find_duplicate_by_extracted_fingerprint.return_value = {"id": str(uuid.uuid4())}
 
-            result = ocr_tasks.process_pending_ocr.run(self.task_self, 12, 7)
+            result = ocr_tasks.process_pending_ocr.run(self.task_self, self.pending_c, self.user_b)
             self.assertFalse(result["success"])
             self.assertEqual(result["reason"], "duplicate_after_ocr")
             db.mark_pending_ocr_failed.assert_called_once()

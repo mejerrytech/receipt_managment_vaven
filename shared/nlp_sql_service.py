@@ -3,11 +3,14 @@
 import os
 import json
 import logging
+import uuid
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 import openai
 import anthropic
 from sqlalchemy import text
+
+from shared.id_types import sql_uuid
 
 load_dotenv()
 
@@ -183,7 +186,7 @@ Respond ONLY with valid JSON in this exact format:
             "suggested_action": "vector_fallback"
         }
 
-    def generate_sql(self, user_query: str, user_id: int) -> Dict[str, Any]:
+    def generate_sql(self, user_query: str, user_id: uuid.UUID) -> Dict[str, Any]:
         """
         Convert natural language query to SQL with user-specific guardrails.
 
@@ -194,6 +197,7 @@ Respond ONLY with valid JSON in this exact format:
         Returns:
             Dict with 'sql', 'explanation', 'is_safe', 'error'
         """
+        uid_lit = sql_uuid(user_id)
         system_prompt = f"""
 You are an AI assistant that converts natural language questions into safe PostgreSQL SQL queries.
 
@@ -203,10 +207,10 @@ DATABASE SCHEMA:
 ========================
 CRITICAL SECURITY RULES:
 ========================
-1. ALWAYS include "WHERE user_id = {user_id}" in the query (MANDATORY)
+1. ALWAYS include "WHERE user_id = {uid_lit}" in the query (MANDATORY)
 2. NEVER access data of other users
 3. ONLY generate SELECT queries (NO INSERT, UPDATE, DELETE, DROP, ALTER)
-4. "my" always refers to user_id = {user_id}
+4. "my" always refers to user_id = {uid_lit}
 5. Return only valid PostgreSQL SQL
 
 ========================
@@ -250,7 +254,7 @@ The frontend expects these columns ONLY (NO id, NO user_id):
        vendor_name AS vendor,
        NULL AS date
    FROM documents
-   WHERE user_id = {user_id} AND vendor_name IS NOT NULL
+   WHERE user_id = {uid_lit} AND vendor_name IS NOT NULL
 
 
 2. If query is about totals (SUM, COUNT, etc.)
@@ -258,12 +262,12 @@ The frontend expects these columns ONLY (NO id, NO user_id):
    - Example:
      SELECT SUM(total_amount) AS amount, currency
      FROM documents
-     WHERE user_id = {user_id}
+     WHERE user_id = {uid_lit}
 
 3. If user asks about their profile/details (e.g., "what is my name", "my username", "who am I"):
    - Query the users table
    - Example:
-     SELECT first_name, last_name, username, telegram_id FROM users WHERE id = {user_id}
+     SELECT first_name, last_name, username, telegram_id FROM users WHERE id = {uid_lit}
 
 4. If data is missing:
    - title → fallback to file_name
@@ -286,7 +290,7 @@ Output:
 User: "Show me my documents"
 Output:
 {{
-    "sql": "SELECT document_type AS type, title, total_amount AS amount, vendor_name AS vendor, created_at AS date FROM documents WHERE user_id = {user_id} ORDER BY created_at DESC",
+    "sql": "SELECT document_type AS type, title, total_amount AS amount, vendor_name AS vendor, created_at AS date FROM documents WHERE user_id = {uid_lit} ORDER BY created_at DESC",
     "explanation": "Retrieves all documents for the user",
     "is_safe": true,
     "error": null
@@ -295,7 +299,7 @@ Output:
 User: "Show invoices from last month"
 Output:
 {{
-    "sql": "SELECT document_type AS type, title, total_amount AS amount, vendor_name AS vendor, created_at AS date FROM documents WHERE user_id = {user_id} AND document_type ILIKE '%invoice%' AND created_at >= NOW() - INTERVAL '1 month' ORDER BY created_at DESC",
+    "sql": "SELECT document_type AS type, title, total_amount AS amount, vendor_name AS vendor, created_at AS date FROM documents WHERE user_id = {uid_lit} AND document_type ILIKE '%invoice%' AND created_at >= NOW() - INTERVAL '1 month' ORDER BY created_at DESC",
     "explanation": "Fetches invoice documents from last month",
     "is_safe": true,
     "error": null
@@ -304,7 +308,7 @@ Output:
 User: "Who are my vendors?"
 Output:
 {{
-    "sql": "SELECT DISTINCT vendor_name AS title, 'vendor' AS type, NULL AS amount, vendor_name AS vendor, NULL AS date FROM documents WHERE user_id = {user_id} AND vendor_name IS NOT NULL",
+    "sql": "SELECT DISTINCT vendor_name AS title, 'vendor' AS type, NULL AS amount, vendor_name AS vendor, NULL AS date FROM documents WHERE user_id = {uid_lit} AND vendor_name IS NOT NULL",
     "explanation": "Retrieves unique vendors",
     "is_safe": true,
     "error": null
@@ -351,13 +355,13 @@ Every query MUST be UI-compatible and follow the exact column structure.
             sql = result.get("sql", "")
             
             # Must contain user filter (user_id for documents table, id for users table)
-            has_user_filter = f"user_id = {user_id}" in sql or f"id = {user_id}" in sql
+            has_user_filter = uid_lit in sql or f"'{user_id}'" in sql
             if sql and not has_user_filter:
                 return {
                     "sql": None,
                     "explanation": None,
                     "is_safe": False,
-                    "error": f"Security error: Query must filter by user_id = {user_id} or id = {user_id}"
+                    "error": f"Security error: Query must filter by user_id = {uid_lit} or id = {uid_lit}"
                 }
             
             return result
@@ -392,13 +396,13 @@ Every query MUST be UI-compatible and follow the exact column structure.
             sql = result.get("sql", "")
             
             # Must contain user filter (user_id for documents table, id for users table)
-            has_user_filter = f"user_id = {user_id}" in sql or f"id = {user_id}" in sql
+            has_user_filter = uid_lit in sql or f"'{user_id}'" in sql
             if sql and not has_user_filter:
                 return {
                     "sql": None,
                     "explanation": None,
                     "is_safe": False,
-                    "error": f"Security error: Query must filter by user_id = {user_id} or id = {user_id}"
+                    "error": f"Security error: Query must filter by user_id = {uid_lit} or id = {uid_lit}"
                 }
             
             return result
@@ -440,7 +444,7 @@ Every query MUST be UI-compatible and follow the exact column structure.
                 "error": str(e),
             }
 
-    def ask_ai(self, user_query: str, user_id: int) -> Dict[str, Any]:
+    def ask_ai(self, user_query: str, user_id: uuid.UUID) -> Dict[str, Any]:
         """
         Complete pipeline: Understand Intent -> Route -> Execute -> Format response.
 
@@ -599,7 +603,7 @@ Provide a natural language summary of these results that directly answers the us
         user_query: str,
         sql: str,
         data: List[Dict],
-        user_id: int
+        user_id: uuid.UUID
     ) -> None:
         """
         Store SQL query and results in vector database for future semantic search.
@@ -673,7 +677,7 @@ Provide a natural language summary of these results that directly answers the us
     def _vector_search_fallback(
         self,
         user_query: str,
-        user_id: int,
+        user_id: uuid.UUID,
         error_reason: str = None
     ) -> Dict[str, Any]:
         """
@@ -773,7 +777,7 @@ Provide a natural language summary of these results that directly answers the us
             
             result = {
                 "success": True,
-                "sql": f"-- VECTOR SEARCH FALLBACK --\n-- Original query: {user_query}\n-- Guardrail: user_id = {user_id}",
+                "sql": f"-- VECTOR SEARCH FALLBACK --\n-- Original query: {user_query}\n-- Guardrail: user_id = {sql_uuid(user_id)}",
                 "explanation": f"Semantic search results (SQL fallback due to: {error_reason or 'unknown error'})",
                 "error": None,
                 "data": filtered_data,
