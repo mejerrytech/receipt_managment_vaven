@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import chromadb
 from chromadb.config import Settings
 from functools import lru_cache
+from shared.llm_usage import record_openai_embedding
 
 load_dotenv()
 
@@ -76,6 +77,12 @@ class VectorService:
                 response = self.openai_client.embeddings.create(
                     model=self.embedding_model,
                     input=text[:8000]
+                )
+                record_openai_embedding(
+                    response,
+                    model=self.embedding_model,
+                    call_type="embedding",
+                    details={"input_chars": len(text[:8000])},
                 )
                 embedding = response.data[0].embedding
 

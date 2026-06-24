@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import openai
 import anthropic
 from sqlalchemy import text
+from shared.llm_usage import record_anthropic_message, record_openai_chat, record_openai_embedding
 
 load_dotenv()
 
@@ -135,6 +136,7 @@ Respond ONLY with valid JSON in this exact format:
                 temperature=0.1,
                 max_tokens=1024
             )
+            record_openai_chat(response, model=GPT4O_MODEL, call_type="legacy_intent")
             
             text = response.choices[0].message.content
             # Clean up JSON if needed
@@ -161,6 +163,7 @@ Respond ONLY with valid JSON in this exact format:
                     {"role": "user", "content": f"Classify this query: {user_query}"}
                 ]
             )
+            record_anthropic_message(response, model=CLAUDE_MODEL, call_type="legacy_intent_fallback")
             
             text = response.content[0].text if hasattr(response, 'content') else str(response)
             # Clean up JSON if needed
@@ -334,6 +337,7 @@ Every query MUST be UI-compatible and follow the exact column structure.
                 temperature=0.1,
                 max_tokens=2048
             )
+            record_openai_chat(response, model=GPT4O_MODEL, call_type="legacy_sql")
             
             text = response.choices[0].message.content
             # Clean up JSON if needed
@@ -375,6 +379,7 @@ Every query MUST be UI-compatible and follow the exact column structure.
                     {"role": "user", "content": f"Convert this query to SQL: {user_query}"}
                 ]
             )
+            record_anthropic_message(response, model=CLAUDE_MODEL, call_type="legacy_sql_fallback")
             
             text = response.content[0].text if hasattr(response, 'content') else str(response)
             # Clean up JSON if needed
@@ -561,6 +566,7 @@ Provide a natural language summary of these results that directly answers the us
                     temperature=0.7,
                     max_tokens=1024
                 )
+                record_openai_chat(response, model=GPT4O_MODEL, call_type="legacy_format")
                 
                 return response.choices[0].message.content
             except Exception as e:
@@ -577,6 +583,7 @@ Provide a natural language summary of these results that directly answers the us
                         {"role": "user", "content": user_prompt}
                     ]
                 )
+                record_anthropic_message(response, model=CLAUDE_MODEL, call_type="legacy_format_fallback")
                 
                 return response.content[0].text if hasattr(response, 'content') else str(response)
             except Exception as e:
@@ -667,6 +674,12 @@ Provide a natural language summary of these results that directly answers the us
         response = self.openai_client.embeddings.create(
             model="text-embedding-3-small",
             input=text[:8000]
+        )
+        record_openai_embedding(
+            response,
+            model="text-embedding-3-small",
+            call_type="legacy_embedding",
+            details={"input_chars": len(text[:8000])},
         )
         return response.data[0].embedding
 

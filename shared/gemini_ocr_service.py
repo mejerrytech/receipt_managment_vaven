@@ -19,6 +19,7 @@ from google.genai import types as genai_types
 from dotenv import load_dotenv
 
 from shared.database import DatabaseService
+from shared.llm_usage import record_gemini_response
 
 load_dotenv()
 
@@ -227,6 +228,12 @@ class GeminiOCRService:
                 temperature=0.1,
                 max_output_tokens=16384,
             ),
+        )
+        record_gemini_response(
+            response,
+            model=GEMINI_MODEL,
+            call_type="ocr_extract",
+            details={"parts": len(contents)},
         )
 
         text = getattr(response, "text", None)

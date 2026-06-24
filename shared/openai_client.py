@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 import openai
 import anthropic
+from shared.llm_usage import record_anthropic_message, record_openai_chat
 
 load_dotenv()
 
@@ -46,6 +47,12 @@ class OpenAIService:
                 temperature=0.7,
                 max_tokens=4096
             )
+            record_openai_chat(
+                response,
+                model=GPT4O_MODEL,
+                call_type="general_chat",
+                details={"use_search": use_search},
+            )
             
             return response.choices[0].message.content
         except Exception as e:
@@ -67,6 +74,12 @@ class OpenAIService:
                 messages=[
                     {"role": "user", "content": prompt}
                 ]
+            )
+            record_anthropic_message(
+                response,
+                model=CLAUDE_MODEL,
+                call_type="general_chat_fallback",
+                details={"use_search": use_search},
             )
             
             return response.content[0].text if hasattr(response, 'content') else str(response)

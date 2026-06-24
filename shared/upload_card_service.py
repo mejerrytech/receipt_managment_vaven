@@ -7,6 +7,7 @@ from typing import Optional
 from google import genai
 from google.genai import types as genai_types
 from dotenv import load_dotenv
+from shared.llm_usage import record_gemini_response
 
 load_dotenv()
 
@@ -140,6 +141,12 @@ class _GeminiSummaryClient:
                 model=GEMINI_MODEL,
                 contents=[prompt],
                 config=self._config(system_instruction),
+            )
+            record_gemini_response(
+                response,
+                model=GEMINI_MODEL,
+                call_type="ocr_summary",
+                details={"prompt_chars": len(prompt)},
             )
             return (response.text or "").strip() or None
         except Exception:

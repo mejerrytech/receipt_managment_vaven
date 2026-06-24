@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 import openai
 import anthropic
+from shared.llm_usage import record_anthropic_message, record_openai_chat
 
 load_dotenv()
 
@@ -128,6 +129,12 @@ class ModelOrchestrator:
                 temperature=temperature,
                 max_tokens=max_tokens
             )
+            record_openai_chat(
+                response,
+                model=GPT4O_MODEL,
+                call_type="orchestrator_chat",
+                details={"has_functions": bool(functions)},
+            )
 
             message = response.choices[0].message
 
@@ -174,6 +181,11 @@ class ModelOrchestrator:
                 messages=[
                     {"role": "user", "content": user_message}
                 ]
+            )
+            record_anthropic_message(
+                response,
+                model=CLAUDE_MODEL,
+                call_type="orchestrator_fallback",
             )
 
             content = response.content[0].text if hasattr(response, 'content') else str(response)
@@ -561,6 +573,11 @@ Examples:
                 messages=[{"role": "user", "content": "Say 'OK'"}],
                 max_tokens=10
             )
+            record_openai_chat(
+                response,
+                model=GPT4O_MINI,
+                call_type="orchestrator_healthcheck",
+            )
             latency = (time.time() - start) * 1000
             results["openai"] = {
                 "status": "healthy" if response.choices[0].message.content else "degraded",
@@ -577,6 +594,11 @@ Examples:
                 model=CLAUDE_SONNET,  # Use sonnet for faster health check
                 max_tokens=10,
                 messages=[{"role": "user", "content": "Say 'OK'"}]
+            )
+            record_anthropic_message(
+                response,
+                model=CLAUDE_SONNET,
+                call_type="orchestrator_healthcheck",
             )
             latency = (time.time() - start) * 1000
             results["anthropic"] = {
