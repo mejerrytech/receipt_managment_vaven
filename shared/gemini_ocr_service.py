@@ -34,31 +34,42 @@ First, assess whether this image is readable:
   cannot be read confidently, respond with exactly:
   {{"status": "unreadable", "message": "I couldn't clearly understand the uploaded image. Please re-upload a clearer image."}}
 
-If the image IS readable, perform OCR on every visible character and then extract all
-meaningful information from the document. Think of this as two tasks in one:
-  1. Read everything you can see, word for word.
-  2. Organise what you read into a clean JSON structure.
+If the image IS readable, extract structured data from the document into JSON.
+Do NOT generate markdown cards, prose summaries, or duplicate the same data in multiple fields.
 
-For the JSON output:
-- Include any fields that are actually present in the document (vendor, date, amounts,
-  line items, invoice/order numbers, tax IDs, addresses, recipient, etc.).
-- For financial documents capture totals, subtotals, taxes and individual line items.
-- Set "expense_category" to the single best match from: {expense_categories}
-- Add a "confidence" object with an "overall" score (0.0-1.0) and per-field scores for
-  the fields you extracted.
-- Put the full raw OCR text in "text_content".
-- Add a "display_card" string: a COMPLETE Markdown summary card for the user.
-  * Start with a bold heading (e.g. **Tax Invoice** or **Receipt Summary**).
-  * Show every extracted field as **Label:** value on its own line.
-  * List EVERY line item as a bullet with description, qty, unit price, and amount.
-  * Include all tax breakdowns and totals.
-  * NO conversational intro ("This is a tax invoice from..."), NO prose paragraph.
-  * Must include ALL items — never summarise or skip line items.
-- Set "status" to "readable".
+Required JSON shape when readable (keep FLAT and compact):
+- "status": "readable"
+- "document_type", "title", "vendor_name", "document_date", "currency"
+- "total_amount", "subtotal", "cgst", "sgst", "igst" (numbers only at top level)
+- "invoice_number", "gstin", "vendor_address" when present
+- "items": array with EVERY visible line item (do not skip, group, or summarise rows).
+  Each item MUST use these keys: "description", "quantity", "unit_price", "amount"
+  (do not use Particulars, Qty/Kg, N/Rate, or other column headers as keys).
+- "expense_category": single best match from: {expense_categories}
+- "confidence": {{"overall": 0.0-1.0}}
+
+Rules:
+- Include only fields actually visible on the document.
+- Do NOT use nested tax objects, tax_slabs arrays, or duplicate summaries.
+- Omit text_content unless absolutely necessary.
+- Keep JSON compact — no display_card, no markdown, no commentary.
+- Finish the JSON object completely; never stop mid-key or mid-array.
 - If the user provided context about the upload, use it as an extra hint: {user_input_text}
 
 Return ONLY the raw JSON object. Do not wrap it in markdown, do not add backticks,
 do not add any explanation before or after the JSON.
+"""
+
+COMPACT_RETRY_PROMPT = """The previous OCR JSON was truncated or invalid.
+Return ONE compact readable receipt JSON only.
+
+Hard limits:
+- Flat keys only (no nested tax_details / tax_slabs).
+- Include EVERY line item visible on the receipt in "items".
+- Include: status, document_type, vendor_name, document_date, currency, total_amount,
+  subtotal, cgst, sgst, igst, invoice_number, gstin, expense_category, confidence.
+- expense_category must be one of: {expense_categories}
+- Complete valid JSON only. No markdown fences.
 """
 
 
@@ -216,23 +227,75 @@ class GeminiOCRService:
             except json.JSONDecodeError:
                 pass
 
+        salvaged = self._salvage_truncated_json(text)
+        if salvaged is not None:
+            logger.warning("Recovered OCR JSON from truncated Gemini response")
+            return salvaged
+
         raise json.JSONDecodeError("No valid JSON found in model response", text, 0)
 
-    async def _call_gemini(self, contents: list) -> str:
+    def _salvage_truncated_json(self, raw: str) -> Optional[Dict[str, Any]]:
+        """Best-effort recovery when the model stops mid-JSON."""
+        text = (raw or "").strip()
+        if text.startswith("```"):
+            newline = text.find("\n")
+            text = text[newline + 1:] if newline != -1 else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        start = text.find("{")
+        if start == -1:
+            return None
+        sliced = text[start:]
+
+        for _ in range(min(len(sliced), 400)):
+            candidate = sliced.rstrip()
+            while candidate and candidate[-1] not in '}]0123456789}"':
+                candidate = candidate[:-1]
+            candidate = candidate.rstrip(",:")
+            open_brackets = candidate.count("[") - candidate.count("]")
+            open_braces = candidate.count("{") - candidate.count("}")
+            if open_brackets < 0 or open_braces < 0:
+                sliced = sliced[:-1]
+                continue
+            closed = candidate + ("]" * open_brackets) + ("}" * open_braces)
+            try:
+                obj = json.loads(closed)
+            except json.JSONDecodeError:
+                sliced = sliced[:-1]
+                continue
+            if not isinstance(obj, dict):
+                sliced = sliced[:-1]
+                continue
+            if obj.get("status") == "unreadable":
+                return obj
+            if obj.get("total_amount") is not None or obj.get("items") or obj.get("line_items"):
+                return obj
+            sliced = sliced[:-1]
+        return None
+
+    def _ocr_config(self, *, call_type: str) -> genai_types.GenerateContentConfig:
+        # thinking_budget=0 keeps output tokens for actual JSON instead of hidden reasoning.
+        return genai_types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=12288,
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+            response_mime_type="application/json",
+        )
+
+    async def _call_gemini(self, contents: list, *, call_type: str = "ocr_extract") -> str:
         """Run the synchronous Gemini SDK call off the event loop."""
         response = await asyncio.to_thread(
             self._client.models.generate_content,
             model=GEMINI_MODEL,
             contents=contents,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=16384,
-            ),
+            config=self._ocr_config(call_type=call_type),
         )
         record_gemini_response(
             response,
             model=GEMINI_MODEL,
-            call_type="ocr_extract",
+            call_type=call_type,
             details={"parts": len(contents)},
         )
 
@@ -287,26 +350,42 @@ class GeminiOCRService:
         )
 
         raw: str = ""
+        image_part = self._image_part(image_bytes, mime_type)
         try:
-            raw = await self._call_gemini([prompt, self._image_part(image_bytes, mime_type)])
+            raw = await self._call_gemini([prompt, image_part])
             result: Dict[str, Any] = self._parse_json(raw)
         except json.JSONDecodeError:
-            logger.error(
-                "Gemini response could not be parsed as JSON. First 400 chars: %s", raw[:400]
+            logger.warning(
+                "Gemini OCR JSON parse failed; retrying compact extraction. First 400 chars: %s",
+                raw[:400],
             )
-            return json.dumps({
-                "status": "unreadable",
-                "message": (
-                    "I couldn't clearly understand the uploaded image. "
-                    "Please re-upload a clearer image."
-                ),
-                "_ocr_metadata": {
-                    "model_used": GEMINI_MODEL,
-                    "overall_confidence": 0.0,
-                    "status": "parse_error",
-                    "fallback_used": False,
-                },
-            })
+            retry_prompt = COMPACT_RETRY_PROMPT.format(
+                expense_categories=categories_str,
+            )
+            try:
+                raw = await self._call_gemini(
+                    [retry_prompt, image_part],
+                    call_type="ocr_extract_retry",
+                )
+                result = self._parse_json(raw)
+                logger.info("Gemini compact OCR retry succeeded")
+            except json.JSONDecodeError:
+                logger.error(
+                    "Gemini OCR retry still invalid. First 400 chars: %s", raw[:400]
+                )
+                return json.dumps({
+                    "status": "unreadable",
+                    "message": (
+                        "I could read part of the receipt but could not finish extraction. "
+                        "Please try again with a clearer, flatter photo."
+                    ),
+                    "_ocr_metadata": {
+                        "model_used": GEMINI_MODEL,
+                        "overall_confidence": 0.0,
+                        "status": "parse_error",
+                        "fallback_used": True,
+                    },
+                })
         except Exception:
             logger.exception("Gemini API call failed")
             raise
@@ -338,15 +417,12 @@ class GeminiOCRService:
 
         overall_confidence = float(confidence_block.get("overall", 0.65))
 
-        display_card = result.get("display_card")
-        if isinstance(display_card, str) and display_card.strip():
-            logger.info(
-                "Gemini OCR extraction successful overall_confidence=%.2f display_card_chars=%s",
-                overall_confidence,
-                len(display_card.strip()),
-            )
-        else:
-            logger.info("Gemini OCR extraction successful overall_confidence=%.2f (no display_card)", overall_confidence)
+        logger.info(
+            "Gemini OCR extraction successful overall_confidence=%.2f fields=%s items=%s",
+            overall_confidence,
+            len([k for k in result if k not in ("confidence", "text_content", "status")]),
+            len(result.get("items") or result.get("line_items") or []),
+        )
 
         return json.dumps({
             **result,

@@ -21,8 +21,13 @@ from shared.image_hash_service import generate_image_hashes
 from shared.nlp_sql_service_v2 import get_nlp_sql_service_v2
 from shared.ocr_service import get_ocr_service
 from shared.openai_client import OpenAIService
+from shared.message_heuristics import (
+    greeting_reply,
+    looks_like_expense_message,
+    looks_like_multi_item_expense,
+)
 from shared.rag_service import get_rag_service
-from shared.upload_card_service import build_whatsapp_review_message
+from shared.upload_card_service import build_whatsapp_review_message_parts
 from shared.whatsapp_request_state import (
     WhatsappRequestRef,
     claim_process_once,
@@ -136,7 +141,7 @@ def _cleanup_message_cache() -> None:
 
 
 # Twilio hard limit is 1600 chars per WhatsApp message body.
-WHATSAPP_PART_LIMIT = 1500
+WHATSAPP_PART_LIMIT = 1590
 
 
 def _split_for_whatsapp(text: str, max_length: int = WHATSAPP_PART_LIMIT) -> list[str]:
@@ -242,6 +247,35 @@ def _send_whatsapp_single_message_sync(to: str, body: str) -> None:
     )
 
 
+async def _send_whatsapp_messages(to: str, parts: list[str]) -> None:
+    """Send multiple WhatsApp bubbles in order (each part must fit Twilio limit)."""
+    if not parts:
+        return
+    if len(parts) == 1:
+        await _send_whatsapp_single_message(to, parts[0])
+        return
+
+    def _sync() -> None:
+        for index, part in enumerate(parts, start=1):
+            body = (part or "").strip()
+            if not body:
+                continue
+            if len(body) > WHATSAPP_PART_LIMIT:
+                for sub in _split_for_whatsapp(body):
+                    _send_whatsapp_single_message_sync(to, sub)
+                continue
+            _send_whatsapp_single_message_sync(to, body)
+            logger.info(
+                "WhatsApp multi-part sent to=%s part=%s/%s chars=%s",
+                normalize_whatsapp_number(to),
+                index,
+                len(parts),
+                len(body),
+            )
+
+    await asyncio.to_thread(_sync)
+
+
 async def _send_whatsapp_single_message(to: str, body: str) -> None:
     await asyncio.to_thread(_send_whatsapp_single_message_sync, to, body)
 
@@ -270,8 +304,15 @@ async def _answer_user_question(db_user, user_text: str, *, log_prefix: str = "n
 
     is_normal_chat = log_prefix == "normal"
 
-    # ── Multi-item paragraph detection (runs only for normal chat) ────────────
     if is_normal_chat:
+        fast_reply = greeting_reply(user_text)
+        if fast_reply:
+            nlp_service_v2._add_to_history(db_user.id, user_text, fast_reply)
+            logger.info("WhatsApp fast-path=greeting (0 LLM calls)")
+            return fast_reply
+
+    # ── Multi-item paragraph detection (runs only for likely multi-item text) ─
+    if is_normal_chat and looks_like_multi_item_expense(user_text):
         multi = nlp_service_v2.classify_multi_item_expense(user_text)
         if multi.get("is_multi_item") and multi.get("items"):
             saved_items = []
@@ -328,7 +369,7 @@ async def _answer_user_question(db_user, user_text: str, *, log_prefix: str = "n
 
     expense_decision = (
         nlp_service_v2.classify_plain_text_expense(user_text)
-        if is_normal_chat
+        if is_normal_chat and looks_like_expense_message(user_text)
         else {"should_store": False, "category": "Other", "user_emotion": "neutral"}
     )
     if is_normal_chat and expense_decision.get("should_store"):
@@ -474,8 +515,8 @@ async def _build_media_review_reply(
     mime_type: str,
     caption: str,
     ocr_raw: str,
-) -> str:
-    """Build pending-document review card with full OCR text for user confirm/edit."""
+) -> str | list[str]:
+    """Build pending-document review card(s) for user confirm/edit."""
     file_size = len(file_bytes)
     file_name = "whatsapp-upload.pdf" if mime_type == "application/pdf" else "whatsapp-upload.jpg"
     content_sha256 = hashlib.sha256(file_bytes).hexdigest()
@@ -513,7 +554,7 @@ async def _build_media_review_reply(
         phash=phash,
         status="pending",
     )
-    return await build_whatsapp_review_message(ocr_raw, pending.id)
+    return await build_whatsapp_review_message_parts(ocr_raw, pending.id)
 
 
 async def _handle_media_upload(form: dict[str, str], db_user) -> str:
@@ -540,13 +581,16 @@ async def _handle_media_upload(form: dict[str, str], db_user) -> str:
             "I couldn't clearly understand the uploaded image. Please re-upload a clearer image.",
         )
 
-    return await _build_media_review_reply(
+    review = await _build_media_review_reply(
         db_user=db_user,
         file_bytes=file_bytes,
         mime_type=mime_type,
         caption=caption,
         ocr_raw=result,
     )
+    if isinstance(review, list):
+        return "\n\n".join(review)
+    return review
 
 
 async def _redis():
@@ -668,6 +712,10 @@ async def _process_media_request_and_send(
         )
 
         extracted_fields = extract_basic_fields_from_ocr_json(ocr_raw)
+        if isinstance(final_message, list):
+            stored_preview = "\n\n".join(final_message)
+        else:
+            stored_preview = final_message
         if client is not None:
             await patch_state(
                 client,
@@ -676,22 +724,25 @@ async def _process_media_request_and_send(
                     "status": "card_ready",
                     "extraction": extracted_fields,
                     "categorization": {"category": extracted_fields.get("category")},
-                    "final_message": final_message,
+                    "final_message": stored_preview,
                 },
                 ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS,
             )
             await mark_completed(
                 client,
                 ref,
-                final_message=final_message,
+                final_message=stored_preview,
                 ttl_seconds=settings.WHATSAPP_REQUEST_STATE_TTL_SECONDS,
             )
 
-        # Single Twilio send after all extraction + card aggregation is done.
+        # Send one or more WhatsApp bubbles (all items, no truncation).
         if not await _claim_send_once(client, ref):
             logger.info("Skipping duplicate send for %s", ref.key)
             return
-        await _send_whatsapp_single_message(from_value, final_message)
+        if isinstance(final_message, list):
+            await _send_whatsapp_messages(from_value, final_message)
+        else:
+            await _send_whatsapp_single_message(from_value, final_message)
     except Exception:
         logger.exception("WhatsApp media pipeline failed request=%s", ref.key)
         msg = "Sorry, I could not process that upload right now. Please try again."

@@ -8,6 +8,11 @@ from google import genai
 from google.genai import types as genai_types
 from dotenv import load_dotenv
 from shared.llm_usage import record_gemini_response
+from shared.receipt_card_formatter import (
+    build_whatsapp_review_from_ocr,
+    build_whatsapp_review_messages,
+    format_receipt_card_markdown,
+)
 
 load_dotenv()
 
@@ -44,8 +49,8 @@ Rewrite as a COMPLETE Markdown card:
 OCR Data:
 {ocr_data}"""
 
-# Twilio WhatsApp body hard limit is 1600; prompt targets a safe budget for one bubble.
-WHATSAPP_MAX_CHARS = 1500
+# Twilio WhatsApp body hard limit is 1600; stay just under it in one bubble.
+WHATSAPP_MAX_CHARS = 1590
 
 WHATSAPP_REVIEW_SYSTEM = f"""You create ONE complete WhatsApp review message for a receipt upload bot.
 
@@ -213,33 +218,48 @@ def _get_summary_client() -> _GeminiSummaryClient:
 
 
 async def build_upload_preview_card(extracted_json: str, confidence: float) -> str:
-    """Build OCR preview card — prefer Gemini OCR display_card, else prompt-based summary."""
+    """Build OCR preview card — deterministic formatter first, Gemini only as fallback."""
     is_high_conf = confidence > 0.8
     data = _safe_json_loads(extracted_json)
 
     display_card = data.get("display_card")
     if isinstance(display_card, str) and display_card.strip():
         summary = display_card.strip()
-        logger.info("Using Gemini OCR display_card chars=%s", len(summary))
+        logger.info("Using OCR display_card chars=%s", len(summary))
     else:
         clean_data = _strip_internal_fields(data)
-        summary = await _get_summary_client().summarise(clean_data)
-        if not summary:
-            summary = "_Could not generate summary. Please review and confirm the upload._"
+        summary = format_receipt_card_markdown(clean_data, for_whatsapp=False)
+        if summary:
+            logger.info("Using deterministic receipt card chars=%s", len(summary))
+        else:
+            summary = await _get_summary_client().summarise(clean_data)
+            if not summary:
+                summary = "_Could not generate summary. Please review and confirm the upload._"
 
     border = "🟢────────────────────────" if is_high_conf else "🟠────────────────────────"
     return f"{border}\n{summary}\n{border}"
 
 
 async def build_whatsapp_review_message(extracted_json: str, pending_id: int) -> str:
-    """Prompt-only WhatsApp review card (single bubble, includes CONFIRM/EDIT footer)."""
+    """WhatsApp review card from OCR JSON without an extra LLM call."""
     data = _safe_json_loads(extracted_json)
-    clean_data = _strip_internal_fields(data)
-    message = await _get_summary_client().whatsapp_review(clean_data, pending_id)
-    if message:
-        return message
-    return (
-        f"_Could not generate review card._\n\n"
-        f"Pending ID: {pending_id}\n"
-        f"CONFIRM {pending_id} to save | EDIT {pending_id} <json>"
+    messages = build_whatsapp_review_messages(data, pending_id, max_chars=WHATSAPP_MAX_CHARS)
+    message = messages[0]
+    logger.info(
+        "WhatsApp review built deterministically chars=%s pending_id=%s",
+        len(message),
+        pending_id,
     )
+    return message
+
+
+async def build_whatsapp_review_message_parts(extracted_json: str, pending_id: int) -> list[str]:
+    """Return separate WhatsApp bubbles so long receipts keep every item."""
+    data = _safe_json_loads(extracted_json)
+    messages = build_whatsapp_review_messages(data, pending_id, max_chars=WHATSAPP_MAX_CHARS)
+    logger.info(
+        "WhatsApp review parts=%s pending_id=%s",
+        len(messages),
+        pending_id,
+    )
+    return messages

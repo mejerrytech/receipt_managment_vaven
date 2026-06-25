@@ -19,6 +19,7 @@ from sqlalchemy import text
 from shared.orchestrator import get_orchestrator, AgentType, ModelProvider, AgentStep
 from shared.vector_service import get_vector_service
 from shared.database import DatabaseService, engine
+from shared.message_heuristics import greeting_reply
 
 load_dotenv()
 
@@ -1544,6 +1545,23 @@ Runtime grounding rules:
         4. Execute Query
         5. Format Response (GPT-4o)
         """
+        fast_reply = greeting_reply(user_query)
+        if fast_reply:
+            self._add_to_history(user_id, user_query, fast_reply)
+            logger.info("Fast-path greeting for '%s' (0 LLM calls)", user_query[:40])
+            return {
+                "success": True,
+                "sql": None,
+                "explanation": None,
+                "error": None,
+                "data": None,
+                "row_count": 0,
+                "columns": None,
+                "ai_response": fast_reply,
+                "fallback": True,
+                "fast_path": "greeting",
+            }
+
         # Step 1: Intent Classification
         intent_analysis = self._understand_intent(user_query, user_id)
         logger.info(f"Intent analysis for '{user_query}': {intent_analysis}")
